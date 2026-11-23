@@ -7,6 +7,7 @@ const state = {
   prevPrice: null,
   klines15m: [],
   prevCvdSnap: null,
+  perVenuePrev: {}, // { BN: snap, BB: snap, OKX: snap }
   lastSummarySignature: '',
   events: []
 };
@@ -50,8 +51,8 @@ function scheduleNext(ms) {
   state.timerId = setTimeout(runCycle, ms);
 }
 
-// Compute CVD from klines (Taker Buy Quote Vol vs Taker Sell Quote Vol)
-function calcCvdFromKlines(klines, bars) {
+// Binance exact taker buy/sell quote delta
+function calcBinanceCvdFromKlines(klines, bars) {
   const slice = klines.slice(-bars);
   let delta = 0;
   let totalVol = 0;
@@ -63,6 +64,98 @@ function calcCvdFromKlines(klines, bars) {
     totalVol += quoteVol;
   }
   return { delta, totalVol };
+}
+
+// Directional flow estimate for exchanges without taker-buy field in candles
+// Bybit kline format: [startTime, open, high, low, close, volume, turnover]
+function calcBybitFlowFromKlines(list, bars) {
+  if (!Array.isArray(list) || !list.length) return null;
+  const slice = list.slice(-bars);
+  let delta = 0;
+  let totalVol = 0;
+  for (const k of slice) {
+    const o = parseFloat(k[1]);
+    const h = parseFloat(k[2]);
+    const l = parseFloat(k[3]);
+    const c = parseFloat(k[4]);
+    const turnover = parseFloat(k[6]);
+    const range = Math.max(h - l, o * 0.0002);
+    const bodyRatio = Math.max(-1, Math.min(1, (c - o) / range));
+    delta += turnover * bodyRatio * 0.35;
+    totalVol += turnover;
+  }
+  return { delta, totalVol };
+}
+
+// OKX candle format: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+function calcOkxFlowFromKlines(list, bars) {
+  if (!Array.isArray(list) || !list.length) return null;
+  const slice = list.slice(-bars);
+  let delta = 0;
+  let totalVol = 0;
+  for (const k of slice) {
+    const o = parseFloat(k[1]);
+    const h = parseFloat(k[2]);
+    const l = parseFloat(k[3]);
+    const c = parseFloat(k[4]);
+    const quoteVol = parseFloat(k[7]);
+    const range = Math.max(h - l, o * 0.0002);
+    const bodyRatio = Math.max(-1, Math.min(1, (c - o) / range));
+    delta += quoteVol * bodyRatio * 0.35;
+    totalVol += quoteVol;
+  }
+  return { delta, totalVol };
+}
+
+async function fetchBybitData(sym) {
+  try {
+    const [linRes, spotRes] = await Promise.all([
+      fetch(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${sym}&interval=15&limit=120`),
+      fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${sym}&interval=15&limit=120`)
+    ]);
+    const [linJson, spotJson] = await Promise.all([linRes.json(), spotRes.json()]);
+    const linList = linJson?.result?.list ? [...linJson.result.list].reverse() : null;
+    const spotList = spotJson?.result?.list ? [...spotJson.result.list].reverse() : null;
+    if (!linList || !spotList || linList.length < 20 || spotList.length < 20) return null;
+
+    return {
+      '15m': { fut: calcBybitFlowFromKlines(linList, 1).delta, spot: calcBybitFlowFromKlines(spotList, 1).delta },
+      '1h':  { fut: calcBybitFlowFromKlines(linList, 4).delta, spot: calcBybitFlowFromKlines(spotList, 4).delta },
+      '4h':  { fut: calcBybitFlowFromKlines(linList, 16).delta, spot: calcBybitFlowFromKlines(spotList, 16).delta },
+      '1D':  { fut: calcBybitFlowFromKlines(linList, 96).delta, spot: calcBybitFlowFromKlines(spotList, 96).delta },
+      vol1h: calcBybitFlowFromKlines(linList, 4).totalVol,
+      vol4h: calcBybitFlowFromKlines(linList, 16).totalVol
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fetchOkxData(sym) {
+  try {
+    const base = sym.replace('USDT', '');
+    const instSwap = `${base}-USDT-SWAP`;
+    const instSpot = `${base}-USDT`;
+    const [swapRes, spotRes] = await Promise.all([
+      fetch(`https://www.okx.com/api/v5/market/candles?instId=${instSwap}&bar=15m&limit=120`),
+      fetch(`https://www.okx.com/api/v5/market/candles?instId=${instSpot}&bar=15m&limit=120`)
+    ]);
+    const [swapJson, spotJson] = await Promise.all([swapRes.json(), spotRes.json()]);
+    const swapList = Array.isArray(swapJson?.data) ? [...swapJson.data].reverse() : null;
+    const spotList = Array.isArray(spotJson?.data) ? [...spotJson.data].reverse() : null;
+    if (!swapList || !spotList || swapList.length < 20 || spotList.length < 20) return null;
+
+    return {
+      '15m': { fut: calcOkxFlowFromKlines(swapList, 1).delta, spot: calcOkxFlowFromKlines(spotList, 1).delta },
+      '1h':  { fut: calcOkxFlowFromKlines(swapList, 4).delta, spot: calcOkxFlowFromKlines(spotList, 4).delta },
+      '4h':  { fut: calcOkxFlowFromKlines(swapList, 16).delta, spot: calcOkxFlowFromKlines(spotList, 16).delta },
+      '1D':  { fut: calcOkxFlowFromKlines(swapList, 96).delta, spot: calcOkxFlowFromKlines(spotList, 96).delta },
+      vol1h: calcOkxFlowFromKlines(swapList, 4).totalVol,
+      vol4h: calcOkxFlowFromKlines(swapList, 16).totalVol
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 // Dynamic Support/Demand, Resistance & Pivots with minimum separation so levels don't clump
@@ -150,7 +243,7 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
 }
 
 // Adaptive Capital Ratio ($) — dynamically shifts weights between 15m/1h and 4h/1D based on activity & flow
-function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlData) {
+function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlData, activeVenues) {
   const f15 = snapNow['15m'].fut;
   const s15 = snapNow['15m'].spot;
   const f1h = snapNow['1h'].fut;
@@ -166,11 +259,10 @@ function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlDa
   const shortMag = Math.abs(f15) + Math.abs(f1h) + Math.abs(s1h) * 2 + Math.abs(dF1h);
   const macroMag = Math.abs(f4h) + Math.abs(f1d) * 0.4 + Math.abs(s4h) * 2 + Math.abs(s1d) * 0.5;
 
-  // Decide whether short-term (15m/1h) or macro (4h/1D) makes more sense right now
-  const shortImpulseStrong = shortMag > macroMag * 0.42 || Math.abs(dF15) > 800000 || fut4hVol < fut1hVol * 2.2;
+  const shortImpulseStrong = shortMag > macroMag * 0.42 || Math.abs(dF15) > 1200000 || fut4hVol < fut1hVol * 2.2;
   const wShort = shortImpulseStrong ? 1.65 : 0.65;
   const wMacro = shortImpulseStrong ? 0.55 : 1.35;
-  const activeTfLabel = shortImpulseStrong ? 'TF: 15m/1h (Άμεση Ροή)' : 'TF: 4h/1D (Δομή)';
+  const activeTfLabel = shortImpulseStrong ? '15m/1h Ροή' : '4h/1D Δομή';
 
   let hlBullWeight = 0;
   let hlBearWeight = 0;
@@ -179,16 +271,19 @@ function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlDa
   if (hlData) {
     const ann = hlData.annualizedPct;
     document.getElementById('hlFundingBadge').textContent =
-      `HL Funding: ${(hlData.fundingHourly * 100).toFixed(4)}%/h (${ann.toFixed(1)}% APR)`;
+      `HL: ${(hlData.fundingHourly * 100).toFixed(4)}%/h (${ann.toFixed(1)}%)`;
     if (hlData.fundingHourly < -0.00005) {
-      hlPain = `Πονάνε οι SHORTS (πληρώνουν longs · OI ${fmtUsd(hlData.oiUsd)})`;
+      hlPain = `Πιέζονται SHORTS (πληρώνουν longs · OI ${fmtUsd(hlData.oiUsd)})`;
       hlBullWeight = hlData.oiUsd * 0.08;
     } else if (hlData.fundingHourly > 0.00015) {
-      hlPain = `Πονάνε οι LONGS (ακριβό funding · OI ${fmtUsd(hlData.oiUsd)})`;
+      hlPain = `Πιέζονται LONGS (ακριβό funding · OI ${fmtUsd(hlData.oiUsd)})`;
       hlBearWeight = hlData.oiUsd * 0.08;
     } else {
-      hlPain = `Ισορροπημένο funding · HL OI: ${fmtUsd(hlData.oiUsd)}`;
+      hlPain = `Ισορροπημένο funding · HL OI: ${fmtUsd(hlData.oiUsd)} · [${activeVenues.join('+')}]`;
     }
+  } else {
+    document.getElementById('hlFundingBadge').textContent = `Venues: ${activeVenues.join('+')}`;
+    hlPain = `Ενεργές πηγές: ${activeVenues.join(' + ')} (HL εκτός)`;
   }
 
   const rawBull =
@@ -201,7 +296,6 @@ function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlDa
     (Math.max(0, -f4h) + Math.max(0, -f1d) * 0.35 + Math.max(0, -s4h) * 2) * wMacro +
     hlBearWeight;
 
-  // Baseline floor from active volume so zero-side never collapses to a misleading $1
   const floorBase = Math.max(250000, (fut1hVol + fut4hVol) * 0.002);
   const bullCap = Math.max(rawBull, floorBase * 0.25);
   const bearCap = Math.max(rawBear, floorBase * 0.25);
@@ -357,22 +451,29 @@ async function runCycle() {
   if (sym !== state.symbol) {
     state.symbol = sym;
     state.prevCvdSnap = null;
+    state.perVenuePrev = {};
     state.lastSummarySignature = '';
   }
   const baseCoin = sym.replace('USDT', '');
 
   try {
-    const [fut15Res, fut1hRes, spot15Res, spot1hRes, hlData] = await Promise.all([
+    const [fut15Res, fut1hRes, spot15Res, spot1hRes, bybitSnap, okxSnap, hlData] = await Promise.all([
       fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=15m&limit=120`),
       fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=1h&limit=48`),
       fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=15m&limit=120`),
       fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=1h&limit=48`),
+      fetchBybitData(sym),
+      fetchOkxData(sym),
       fetchHyperliquidPain(baseCoin)
     ]);
 
     const [fut15, fut1h, spot15, spot1h] = await Promise.all([
       fut15Res.json(), fut1hRes.json(), spot15Res.json(), spot1hRes.json()
     ]);
+
+    if (!Array.isArray(fut15) || !fut15.length) {
+      throw new Error('Binance klines unavailable');
+    }
 
     const currentPrice = parseFloat(fut15[fut15.length - 1][4]);
     state.prevPrice = state.lastPrice;
@@ -381,48 +482,89 @@ async function runCycle() {
 
     document.getElementById('livePrice').textContent = `$${fmtPrice(currentPrice)}`;
 
-    const fut1hCalc = calcCvdFromKlines(fut15, 4);
-    const fut4hCalc = calcCvdFromKlines(fut1h, 4);
+    const bnFut1h = calcBinanceCvdFromKlines(fut15, 4);
+    const bnFut4h = calcBinanceCvdFromKlines(fut1h, 4);
 
-    const tfs = [
-      { key: '15m', fut: calcCvdFromKlines(fut15, 1), spot: calcCvdFromKlines(spot15, 1) },
-      { key: '1h',  fut: fut1hCalc, spot: calcCvdFromKlines(spot15, 4) },
-      { key: '4h',  fut: fut4hCalc, spot: calcCvdFromKlines(spot1h, 4) },
-      { key: '1D',  fut: calcCvdFromKlines(fut1h, 24), spot: calcCvdFromKlines(spot1h, 24) }
-    ];
+    const bnSnap = {
+      '15m': { fut: calcBinanceCvdFromKlines(fut15, 1).delta, spot: calcBinanceCvdFromKlines(spot15, 1).delta },
+      '1h':  { fut: bnFut1h.delta, spot: calcBinanceCvdFromKlines(spot15, 4).delta },
+      '4h':  { fut: bnFut4h.delta, spot: calcBinanceCvdFromKlines(spot1h, 4).delta },
+      '1D':  { fut: calcBinanceCvdFromKlines(fut1h, 24).delta, spot: calcBinanceCvdFromKlines(spot1h, 24).delta }
+    };
 
+    const venues = [{ code: 'BN', snap: bnSnap }];
+    if (bybitSnap) venues.push({ code: 'BB', snap: bybitSnap });
+    if (okxSnap) venues.push({ code: 'OKX', snap: okxSnap });
+
+    const tfKeys = ['15m', '1h', '4h', '1D'];
     const snapNow = {};
-    tfs.forEach(t => {
-      snapNow[t.key] = { fut: t.fut.delta, spot: t.spot.delta };
+    const deltaNow = {};
+
+    tfKeys.forEach(k => {
+      let sumFut = 0;
+      let sumSpot = 0;
+      let dFutSum = 0;
+      let dSpotSum = 0;
+      let anyComparable = false;
+
+      venues.forEach(v => {
+        sumFut += v.snap[k].fut;
+        sumSpot += v.snap[k].spot;
+
+        const prevV = state.perVenuePrev[v.code];
+        if (prevV && prevV[k]) {
+          dFutSum += (v.snap[k].fut - prevV[k].fut);
+          dSpotSum += (v.snap[k].spot - prevV[k].spot);
+          anyComparable = true;
+        }
+      });
+
+      snapNow[k] = { fut: sumFut, spot: sumSpot };
+      deltaNow[k] = {
+        fut: anyComparable ? dFutSum : null,
+        spot: anyComparable ? dSpotSum : null
+      };
     });
 
-    const prev = state.prevCvdSnap;
+    // Update per-venue history only for venues that succeeded in this cycle
+    venues.forEach(v => {
+      state.perVenuePrev[v.code] = v.snap;
+    });
+
+    const activeCodes = venues.map(v => v.code);
+    if (hlData) activeCodes.push('HL');
+
     const tbody = document.getElementById('cvdTableBody');
-    tbody.innerHTML = tfs.map(t => {
-      const dFut = prev ? (t.fut.delta - prev[t.key].fut) : 0;
-      const dSpot = prev ? (t.spot.delta - prev[t.key].spot) : 0;
+    tbody.innerHTML = tfKeys.map(key => {
+      const fVal = snapNow[key].fut;
+      const sVal = snapNow[key].spot;
+      const dFut = deltaNow[key].fut;
+      const dSpot = deltaNow[key].spot;
+      const hasDelta = dFut !== null && dSpot !== null;
+
       let pace = 'Σταθερό';
       let paceCls = '';
-      if (prev) {
-        if (t.fut.delta > 0 && dFut > 350000) { pace = 'Επιταχύνει ↑'; paceCls = 'pos'; }
-        else if (t.fut.delta > 0 && dFut < -350000) { pace = 'Μαλακώνει ↓'; paceCls = 'warn-txt'; }
-        else if (t.fut.delta < 0 && dFut < -350000) { pace = 'Πιέζει κάτω ↓'; paceCls = 'neg'; }
-        else if (t.fut.delta < 0 && dFut > 350000) { pace = 'Απορρόφηση ↑'; paceCls = 'pos'; }
+      if (hasDelta) {
+        if (fVal > 0 && dFut > 500000) { pace = 'Επιταχύνει ↑'; paceCls = 'pos'; }
+        else if (fVal > 0 && dFut < -500000) { pace = 'Μαλακώνει ↓'; paceCls = 'warn-txt'; }
+        else if (fVal < 0 && dFut < -500000) { pace = 'Πιέζει κάτω ↓'; paceCls = 'neg'; }
+        else if (fVal < 0 && dFut > 500000) { pace = 'Απορρόφηση ↑'; paceCls = 'pos'; }
       }
+
       return `
         <tr>
-          <td><strong>${t.key}</strong></td>
-          <td class="${t.fut.delta >= 0 ? 'pos' : 'neg'}">${fmtUsd(t.fut.delta)}</td>
-          <td class="${dFut >= 0 ? 'pos' : 'neg'}">${prev ? fmtUsd(dFut) : '--'}</td>
-          <td class="${t.spot.delta >= 0 ? 'pos' : 'neg'}">${fmtUsd(t.spot.delta)}</td>
-          <td class="${dSpot >= 0 ? 'pos' : 'neg'}">${prev ? fmtUsd(dSpot) : '--'}</td>
+          <td><strong>${key}</strong></td>
+          <td class="${fVal >= 0 ? 'pos' : 'neg'}">${fmtUsd(fVal)}</td>
+          <td class="${hasDelta ? (dFut >= 0 ? 'pos' : 'neg') : ''}">${hasDelta ? fmtUsd(dFut) : '--'}</td>
+          <td class="${sVal >= 0 ? 'pos' : 'neg'}">${fmtUsd(sVal)}</td>
+          <td class="${hasDelta ? (dSpot >= 0 ? 'pos' : 'neg') : ''}">${hasDelta ? fmtUsd(dSpot) : '--'}</td>
           <td class="${paceCls}">${pace}</td>
         </tr>
       `;
     }).join('');
 
     document.getElementById('snapClock').textContent =
-      `Τελευταίο snapshot: ${new Date().toLocaleTimeString('el-GR')}`;
+      `Snapshot: ${new Date().toLocaleTimeString('el-GR')} · [${activeCodes.join('+')}]`;
 
     const struct = computeDynamicStructure(fut15, currentPrice, snapNow['1h'].fut);
     drawChart(fut15, struct);
@@ -440,8 +582,11 @@ async function runCycle() {
       <span>■ Liquidity Pool: $${fmtPrice(struct.supplyBottom)} – $${fmtPrice(struct.supplyTop)}</span>
     `;
 
+    const totalVol1h = bnFut1h.totalVol + (bybitSnap?.vol1h || 0) + (okxSnap?.vol1h || 0);
+    const totalVol4h = bnFut4h.totalVol + (bybitSnap?.vol4h || 0) + (okxSnap?.vol4h || 0);
+
     const cap = computeAdaptiveCapitalRatio(
-      snapNow, prev, fut1hCalc.totalVol, fut4hCalc.totalVol, hlData
+      snapNow, state.prevCvdSnap, totalVol1h, totalVol4h, hlData, activeCodes
     );
     document.getElementById('hlPainText').textContent = cap.hlPain;
     document.getElementById('bullCapVal').textContent = fmtUsd(cap.bullCap);
@@ -450,10 +595,9 @@ async function runCycle() {
     document.getElementById('capRatioText').textContent =
       `${cap.ratio} : 1 (${cap.bullShare.toFixed(0)}% Υπέρ / ${(100 - cap.bullShare).toFixed(0)}% Κατά) · ${cap.activeTfLabel}`;
 
-    // Situation Summary (Updates ONLY when regime/flow meaningfully changes)
     const f1h = snapNow['1h'].fut;
     const s1h = snapNow['1h'].spot;
-    const dF1h = prev ? (f1h - prev['1h'].fut) : 0;
+    const dF1h = deltaNow['1h'].fut ?? 0;
 
     let regime = 'NEUTRAL';
     let cardClass = 'summary-card';
@@ -465,38 +609,38 @@ async function runCycle() {
       regime = 'HARD_PIVOT_BREAK';
       cardClass = 'summary-card bear';
       headline = `ΣΚΛΗΡΟ PIVOT: Διάσπαση κάτω από $${fmtPrice(struct.hardPivot)} με πωλητική ροή`;
-      detail = `Η δομή γύρισε καθοδικά και οι πωλητές σπρώχνουν (${fmtUsd(f1h)} στο 1h). Δεν ισχύει πλέον η ανοδική στήριξη — προτεραιότητα η προστασία ή στροφή ανάλογα με το macro σου.`;
-      syncLabel = 'Πίεση πωλητών σε Futures & δομή';
+      detail = `Η δομή γύρισε καθοδικά και οι πωλητές σπρώχνουν (${fmtUsd(f1h)} στο 1h, πηγές ${activeCodes.join('+')}). Προτεραιότητα η προστασία ή στροφή ανάλογα με το macro σου.`;
+      syncLabel = `Πίεση πωλητών [${activeCodes.join('+')}]`;
     } else if (f1h > 0 && s1h > 0 && dF1h >= 0) {
       regime = 'ALIGNED_BULL';
       cardClass = 'summary-card bull';
-      headline = `Θετική εισροή σε Futures & Spot — φαίνεται να κατευθύνεται προς το Pool $${fmtPrice(struct.supplyBottom)}`;
-      detail = `Συμφωνία αγοραστών (${fmtUsd(f1h)} Perps / ${fmtUsd(s1h)} Spot στο 1h) χωρίς εξασθένιση. Όσο κρατάει πάνω από το Μαλακό Pivot ($${fmtPrice(struct.softPivot)}), η ροή ευνοεί συνέχιση προς την επόμενη ζώνη ρευστότητας.`;
-      syncLabel = 'Συμφωνία Spot + Futures ↑';
+      headline = `Θετική εισροή σε Futures & Spot — κατεύθυνση προς Pool $${fmtPrice(struct.supplyBottom)}`;
+      detail = `Συμφωνία αγοραστών (${fmtUsd(f1h)} Perps / ${fmtUsd(s1h)} Spot στο 1h σε ${activeCodes.join('+')}). Όσο κρατάει πάνω από το Μαλακό Pivot ($${fmtPrice(struct.softPivot)}), η ροή ευνοεί συνέχεια.`;
+      syncLabel = `Συμφωνία Spot + Futures ↑`;
     } else if (f1h > 0 && s1h <= 0) {
       regime = 'PERP_SPOT_DIVERGENCE';
       cardClass = 'summary-card warn';
       headline = `Ασυμφωνία Futures CVD με Spot — η άνοδος πατάει σε μόχλευση`;
-      detail = `Τα Futures δείχνουν θετικό Delta (${fmtUsd(f1h)}), αλλά το Spot δεν ακολουθεί (${fmtUsd(s1h)}). Προσοχή σε απότομο σκούπισμα προς τη ζώνη Demand ($${fmtPrice(struct.demandTop)}) πριν υπάρξει καθαρή συνέχεια.`;
-      syncLabel = 'Ασυμφωνία: Perps ↑ / Spot ↓';
-    } else if (f1h > 0 && dF1h < -400000) {
+      detail = `Τα Futures δείχνουν θετικό Delta (${fmtUsd(f1h)}), αλλά το Spot δεν ακολουθεί (${fmtUsd(s1h)}). Προσοχή σε σκούπισμα προς Demand ($${fmtPrice(struct.demandTop)}).`;
+      syncLabel = `Ασυμφωνία: Perps ↑ / Spot ↓`;
+    } else if (f1h > 0 && dF1h < -500000) {
       regime = 'MOMENTUM_COOLING';
       cardClass = 'summary-card warn';
-      headline = `Μαλακώνει η θετική εισροή στο CVD — η κίνηση χάνει φόρα (Μαλακό Pivot $${fmtPrice(struct.softPivot)})`;
-      detail = `Το 1h CVD παραμένει θετικό (${fmtUsd(f1h)}) αλλά μειώθηκε κατά ${fmtUsd(dF1h)} σε σχέση με το προηγούμενο snapshot. Σημάδι χώνεψης ή δοκιμής στήριξης — πάγωμα επιθετικών προσθηκών μέχρι να ξαναδείξει απορρόφηση.`;
-      syncLabel = 'Εξασθένιση ορμής';
+      headline = `Μαλακώνει η θετική εισροή στο CVD — χάνει φόρα (S-Pivot $${fmtPrice(struct.softPivot)})`;
+      detail = `Το 1h CVD παραμένει θετικό (${fmtUsd(f1h)}) αλλά επιβράδυνε κατά ${fmtUsd(dF1h)} σε σχέση με το προηγούμενο snapshot.`;
+      syncLabel = `Εξασθένιση ορμής`;
     } else if (currentPrice <= struct.demandTop && dF1h > 0) {
       regime = 'DEMAND_ABSORPTION';
       cardClass = 'summary-card bull';
       headline = `Απορρόφηση μέσα στη ζώνη Demand ($${fmtPrice(struct.demandBottom)} – $${fmtPrice(struct.demandTop)})`;
-      detail = `Η τιμή κατέβηκε στη στήριξη αλλά η αρνητική πίεση μαζεύεται (${fmtUsd(dF1h)} βελτίωση ροής). Αν κρατήσει το Σκληρό Pivot ($${fmtPrice(struct.hardPivot)}), στήνεται βάση αντίδρασης.`;
-      syncLabel = 'Απορρόφηση σε στήριξη';
+      detail = `Η τιμή δοκιμάζει στήριξη με βελτίωση ροής (${fmtUsd(dF1h)}). Κρίσιμο το Σκληρό Pivot ($${fmtPrice(struct.hardPivot)}).`;
+      syncLabel = `Απορρόφηση σε στήριξη`;
     } else {
       regime = 'RANGE_WAIT';
       cardClass = 'summary-card';
       headline = `Πλάγια χώνεψη ανάμεσα σε Demand ($${fmtPrice(struct.demandTop)}) και Pool ($${fmtPrice(struct.supplyBottom)})`;
-      detail = `Δεν υπάρχει ακόμα καθαρό ξέσπασμα εισροών (${fmtUsd(f1h)} 1h Perp). Αναμονή για επιτάχυνση CVD ή σκούπισμα ζώνης πριν από εκτέλεση.`;
-      syncLabel = 'Ουδέτερη / Πλάγια ροή';
+      detail = `Χωρίς καθαρό ξέσπασμα εισροών (${fmtUsd(f1h)} 1h Perp · πηγές ${activeCodes.join('+')}). Αναμονή για επιτάχυνση CVD ή σκούπισμα ζώνης.`;
+      syncLabel = `Ουδέτερη / Πλάγια ροή`;
     }
 
     document.getElementById('pillFlow').textContent = `1h Perp: ${fmtUsd(f1h)} | 4h: ${fmtUsd(snapNow['4h'].fut)}`;
@@ -510,11 +654,12 @@ async function runCycle() {
       document.getElementById('summaryHeadline').textContent = headline;
       document.getElementById('summaryDetail').textContent = detail;
       document.getElementById('summaryUpdated').textContent =
-        `Ενημερώθηκε: ${new Date().toLocaleTimeString('el-GR')} (αλλαγή εικόνας)`;
+        `Ενημερώθηκε: ${new Date().toLocaleTimeString('el-GR')} [${activeCodes.join('+')}]`;
       pushEvent(regime.replaceAll('_', ' '), headline);
     }
 
     state.prevCvdSnap = snapNow;
+
     if (state.pollOverride === 'AUTO') {
       const priceMovePct = state.prevPrice
         ? Math.abs((currentPrice - state.prevPrice) / state.prevPrice) * 100
@@ -522,7 +667,7 @@ async function runCycle() {
       const nearPivot =
         Math.abs(currentPrice - struct.softPivot) / currentPrice < 0.0035 ||
         Math.abs(currentPrice - struct.hardPivot) / currentPrice < 0.004;
-      const flowBurst = Math.abs(dF1h) > 1500000 || priceMovePct > 0.18;
+      const flowBurst = Math.abs(dF1h) > 2000000 || priceMovePct > 0.18;
 
       scheduleNext((nearPivot || flowBurst) ? 5000 : 45000);
     } else {
