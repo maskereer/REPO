@@ -88,7 +88,7 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
     if (isSwingLow) swingLows.push(l);
   }
 
-  const minBandGap = currentPrice * 0.0045; // ~0.45% minimum separation between distinct zones
+  const minBandGap = currentPrice * 0.0045;
 
   const pickSeparated = (candidates, asc) => {
     const sorted = [...candidates].sort((a, b) => asc ? a - b : b - a);
@@ -115,12 +115,10 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
   const supplyBottom = resistsAbove[0] ?? (currentPrice + span * 0.25);
   const supplyTop = resistsAbove[1] ?? Math.min(maxHigh, supplyBottom + span * 0.22);
 
-  // Soft Pivot sits cleanly between current price and demandTop (or supplyBottom if below demand)
   const softPivot = currentPrice >= demandTop
     ? Math.max(demandTop + minBandGap * 0.4, currentPrice - span * 0.12)
     : Math.min(supplyBottom - minBandGap * 0.4, currentPrice + span * 0.12);
 
-  // Hard Pivot sits at the base of the primary demand zone
   const hardPivot = Math.min(demandBottom, demandTop - minBandGap * 0.6);
 
   const lastBar = klines[klines.length - 1];
@@ -148,6 +146,76 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
     softPivot,
     hardPivot,
     zoneBehavior
+  };
+}
+
+// Adaptive Capital Ratio ($) — dynamically shifts weights between 15m/1h and 4h/1D based on activity & flow
+function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlData) {
+  const f15 = snapNow['15m'].fut;
+  const s15 = snapNow['15m'].spot;
+  const f1h = snapNow['1h'].fut;
+  const s1h = snapNow['1h'].spot;
+  const f4h = snapNow['4h'].fut;
+  const s4h = snapNow['4h'].spot;
+  const f1d = snapNow['1D'].fut;
+  const s1d = snapNow['1D'].spot;
+
+  const dF15 = prevSnap ? (f15 - prevSnap['15m'].fut) : 0;
+  const dF1h = prevSnap ? (f1h - prevSnap['1h'].fut) : 0;
+
+  const shortMag = Math.abs(f15) + Math.abs(f1h) + Math.abs(s1h) * 2 + Math.abs(dF1h);
+  const macroMag = Math.abs(f4h) + Math.abs(f1d) * 0.4 + Math.abs(s4h) * 2 + Math.abs(s1d) * 0.5;
+
+  // Decide whether short-term (15m/1h) or macro (4h/1D) makes more sense right now
+  const shortImpulseStrong = shortMag > macroMag * 0.42 || Math.abs(dF15) > 800000 || fut4hVol < fut1hVol * 2.2;
+  const wShort = shortImpulseStrong ? 1.65 : 0.65;
+  const wMacro = shortImpulseStrong ? 0.55 : 1.35;
+  const activeTfLabel = shortImpulseStrong ? 'TF: 15m/1h (Άμεση Ροή)' : 'TF: 4h/1D (Δομή)';
+
+  let hlBullWeight = 0;
+  let hlBearWeight = 0;
+  let hlPain = 'Ουδέτερο funding (χωρίς ακραίο πόνο)';
+
+  if (hlData) {
+    const ann = hlData.annualizedPct;
+    document.getElementById('hlFundingBadge').textContent =
+      `HL Funding: ${(hlData.fundingHourly * 100).toFixed(4)}%/h (${ann.toFixed(1)}% APR)`;
+    if (hlData.fundingHourly < -0.00005) {
+      hlPain = `Πονάνε οι SHORTS (πληρώνουν longs · OI ${fmtUsd(hlData.oiUsd)})`;
+      hlBullWeight = hlData.oiUsd * 0.08;
+    } else if (hlData.fundingHourly > 0.00015) {
+      hlPain = `Πονάνε οι LONGS (ακριβό funding · OI ${fmtUsd(hlData.oiUsd)})`;
+      hlBearWeight = hlData.oiUsd * 0.08;
+    } else {
+      hlPain = `Ισορροπημένο funding · HL OI: ${fmtUsd(hlData.oiUsd)}`;
+    }
+  }
+
+  const rawBull =
+    (Math.max(0, f15) + Math.max(0, f1h) + Math.max(0, s1h) * 2 + Math.max(0, dF15)) * wShort +
+    (Math.max(0, f4h) + Math.max(0, f1d) * 0.35 + Math.max(0, s4h) * 2) * wMacro +
+    hlBullWeight;
+
+  const rawBear =
+    (Math.max(0, -f15) + Math.max(0, -f1h) + Math.max(0, -s1h) * 2 + Math.max(0, -dF15)) * wShort +
+    (Math.max(0, -f4h) + Math.max(0, -f1d) * 0.35 + Math.max(0, -s4h) * 2) * wMacro +
+    hlBearWeight;
+
+  // Baseline floor from active volume so zero-side never collapses to a misleading $1
+  const floorBase = Math.max(250000, (fut1hVol + fut4hVol) * 0.002);
+  const bullCap = Math.max(rawBull, floorBase * 0.25);
+  const bearCap = Math.max(rawBear, floorBase * 0.25);
+
+  const bullShare = (bullCap / (bullCap + bearCap)) * 100;
+  const ratio = (bullCap / bearCap).toFixed(2);
+
+  return {
+    bullCap,
+    bearCap,
+    bullShare,
+    ratio,
+    hlPain,
+    activeTfLabel
   };
 }
 
@@ -214,19 +282,16 @@ function drawChart(klines, struct) {
 
   ctx.clearRect(0, 0, w, h);
 
-  // Demand Zone band
   const yDemTop = yOf(struct.demandTop);
   const yDemBot = yOf(struct.demandBottom);
   ctx.fillStyle = 'rgba(16, 185, 129, 0.14)';
   ctx.fillRect(0, Math.min(yDemTop, yDemBot), plotW, Math.max(8, Math.abs(yDemBot - yDemTop)));
 
-  // Resistance / Liquidity Pool band
   const ySupTop = yOf(struct.supplyTop);
   const ySupBot = yOf(struct.supplyBottom);
   ctx.fillStyle = 'rgba(239, 68, 68, 0.12)';
   ctx.fillRect(0, Math.min(ySupTop, ySupBot), plotW, Math.max(8, Math.abs(ySupBot - ySupTop)));
 
-  // Soft Pivot dashed line
   const ySoft = yOf(struct.softPivot);
   ctx.strokeStyle = '#f59e0b';
   ctx.setLineDash([5, 4]);
@@ -236,7 +301,6 @@ function drawChart(klines, struct) {
   ctx.lineTo(plotW, ySoft);
   ctx.stroke();
 
-  // Hard Pivot solid line
   const yHard = yOf(struct.hardPivot);
   ctx.strokeStyle = '#ef4444';
   ctx.setLineDash([]);
@@ -246,7 +310,6 @@ function drawChart(klines, struct) {
   ctx.lineTo(plotW, yHard);
   ctx.stroke();
 
-  // Candlesticks
   const step = plotW / view.length;
   const candleW = Math.max(2, step * 0.62);
   view.forEach((k, i) => {
@@ -269,7 +332,6 @@ function drawChart(klines, struct) {
     ctx.fillRect(x - candleW / 2, top, candleW, Math.max(1.5, bot - top));
   });
 
-  // Right price labels with anti-overlap spacing
   ctx.font = '11px monospace';
   ctx.textAlign = 'left';
   const labels = [
@@ -319,10 +381,13 @@ async function runCycle() {
 
     document.getElementById('livePrice').textContent = `$${fmtPrice(currentPrice)}`;
 
+    const fut1hCalc = calcCvdFromKlines(fut15, 4);
+    const fut4hCalc = calcCvdFromKlines(fut1h, 4);
+
     const tfs = [
       { key: '15m', fut: calcCvdFromKlines(fut15, 1), spot: calcCvdFromKlines(spot15, 1) },
-      { key: '1h',  fut: calcCvdFromKlines(fut15, 4), spot: calcCvdFromKlines(spot15, 4) },
-      { key: '4h',  fut: calcCvdFromKlines(fut1h, 4), spot: calcCvdFromKlines(spot1h, 4) },
+      { key: '1h',  fut: fut1hCalc, spot: calcCvdFromKlines(spot15, 4) },
+      { key: '4h',  fut: fut4hCalc, spot: calcCvdFromKlines(spot1h, 4) },
       { key: '1D',  fut: calcCvdFromKlines(fut1h, 24), spot: calcCvdFromKlines(spot1h, 24) }
     ];
 
@@ -375,48 +440,15 @@ async function runCycle() {
       <span>■ Liquidity Pool: $${fmtPrice(struct.supplyBottom)} – $${fmtPrice(struct.supplyTop)}</span>
     `;
 
-    // Hyperliquid Pain & Capital Ratio ($) with broader 4h+1D flow + OI context
-    let hlPain = 'Ουδέτερο funding (χωρίς ακραίο πόνο)';
-    let hlBullWeight = 0;
-    let hlBearWeight = 0;
-    if (hlData) {
-      const ann = hlData.annualizedPct;
-      document.getElementById('hlFundingBadge').textContent =
-        `HL Funding: ${(hlData.fundingHourly * 100).toFixed(4)}%/h (${ann.toFixed(1)}% APR)`;
-      if (hlData.fundingHourly < -0.00005) {
-        hlPain = `Πονάνε οι SHORTS (πληρώνουν longs · OI ${fmtUsd(hlData.oiUsd)})`;
-        hlBullWeight = hlData.oiUsd * 0.08;
-      } else if (hlData.fundingHourly > 0.00015) {
-        hlPain = `Πονάνε οι LONGS (ακριβό funding · OI ${fmtUsd(hlData.oiUsd)})`;
-        hlBearWeight = hlData.oiUsd * 0.08;
-      } else {
-        hlPain = `Ισορροπημένο funding · HL OI: ${fmtUsd(hlData.oiUsd)}`;
-      }
-    }
-    document.getElementById('hlPainText').textContent = hlPain;
-
-    const bullCap =
-      Math.max(0, snapNow['4h'].fut) +
-      Math.max(0, snapNow['1D'].fut * 0.35) +
-      Math.max(0, snapNow['4h'].spot) * 2 +
-      hlBullWeight;
-
-    const bearCap =
-      Math.max(0, -snapNow['4h'].fut) +
-      Math.max(0, -snapNow['1D'].fut * 0.35) +
-      Math.max(0, -snapNow['4h'].spot) * 2 +
-      hlBearWeight;
-
-    const safeBull = bullCap > 0 ? bullCap : 100000;
-    const safeBear = bearCap > 0 ? bearCap : 100000;
-    const bullShare = (safeBull / (safeBull + safeBear)) * 100;
-    const ratio = (safeBull / safeBear).toFixed(2);
-
-    document.getElementById('bullCapVal').textContent = fmtUsd(bullCap);
-    document.getElementById('bearCapVal').textContent = fmtUsd(bearCap);
-    document.getElementById('capRatioFill').style.width = `${bullShare.toFixed(1)}%`;
+    const cap = computeAdaptiveCapitalRatio(
+      snapNow, prev, fut1hCalc.totalVol, fut4hCalc.totalVol, hlData
+    );
+    document.getElementById('hlPainText').textContent = cap.hlPain;
+    document.getElementById('bullCapVal').textContent = fmtUsd(cap.bullCap);
+    document.getElementById('bearCapVal').textContent = fmtUsd(cap.bearCap);
+    document.getElementById('capRatioFill').style.width = `${cap.bullShare.toFixed(1)}%`;
     document.getElementById('capRatioText').textContent =
-      `${ratio} : 1 (${bullShare.toFixed(0)}% Υπέρ / ${(100 - bullShare).toFixed(0)}% Κατά)`;
+      `${cap.ratio} : 1 (${cap.bullShare.toFixed(0)}% Υπέρ / ${(100 - cap.bullShare).toFixed(0)}% Κατά) · ${cap.activeTfLabel}`;
 
     // Situation Summary (Updates ONLY when regime/flow meaningfully changes)
     const f1h = snapNow['1h'].fut;
