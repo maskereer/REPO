@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CROSS RADAR — Autonomous Flow, Zones & Pivot Engine</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>CROSS RADAR</h1>
+    <span id="modeBadge" class="badge mod">AUTO · MODERATE (45s)</span>
+  </div>
+  <div class="controls">
+    <select id="symbolSelect" title="Asset">
+      <option value="BTCUSDT" selected>BTC / USDT</option>
+      <option value="ETHUSDT">ETH / USDT</option>
+      <option value="KASUSDT">KAS / USDT</option>
+    </select>
+    <button id="btnAuto" class="active" onclick="setPollOverride('AUTO')">AUTO</button>
+    <button id="btnTurbo" onclick="setPollOverride('TURBO')">5s TURBO</button>
+    <button id="btnMod" onclick="setPollOverride('MOD')">MODERATE</button>
+    <div id="livePrice" class="price-box">--,--</div>
+  </div>
+</header>
+
+<!-- SITUATION SUMMARY (Updates only on meaningful state change) -->
+<section id="summaryCard" class="summary-card">
+  <div class="summary-top">
+    <span class="summary-label">Situation Summary · Αυτόματη Ανάγνωση Ροής & Δομής</span>
+    <span id="summaryUpdated" class="summary-time">Αρχικοποίηση δεδομένων...</span>
+  </div>
+  <div id="summaryHeadline" class="summary-headline">Συλλογή πρώτων snapshots ροής & δομής αγοράς...</div>
+  <div id="summaryDetail" class="summary-detail">
+    Το σύστημα συγκρίνει Spot vs Futures εισροές, υπολογίζει δυναμικές ζώνες στήριξης/ρευστότητας και εντοπίζει τα σημεία Pivot.
+  </div>
+  <div class="summary-pills">
+    <span id="pillFlow" class="pill">Ροή: --</span>
+    <span id="pillSync" class="pill">Spot vs Perp: --</span>
+    <span id="pillPivot" class="pill">Pivot Status: --</span>
+  </div>
+</section>
+
+<!-- MAIN: CHART + PIVOT / HYPERLIQUID / CAPITAL RATIO -->
+<section class="grid-main">
+  <div class="card">
+    <div class="card-title">
+      <span>Δυναμικό Chart · Auto Demand / Resistance & Pivot Levels</span>
+      <span id="zoneStatus" class="zone-status-txt">--</span>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="radarCanvas"></canvas>
+    </div>
+    <div class="zone-legend" id="zoneLegend">
+      <span>Υπολογισμός δυναμικών ζωνών από live δομή...</span>
+    </div>
+  </div>
+
+  <div class="stack">
+    <!-- PIVOT ENGINE -->
+    <div class="card">
+      <div class="card-title">
+        <span>Αυτόματα Σημεία Pivot (Μηδέν Προεπιλογές)</span>
+        <span id="structureState" class="pos">ΣΥΝΕΧΕΙΑ</span>
+      </div>
+      <div class="metric-row">
+        <span>Μαλακό Pivot (Πάγωμα Ενίσχυσης):</span>
+        <span id="softPivotVal" class="metric-val warn-txt">--</span>
+      </div>
+      <div class="metric-row">
+        <span>Σκληρό Pivot (Δομική Στροφή):</span>
+        <span id="hardPivotVal" class="metric-val neg">--</span>
+      </div>
+      <div class="metric-row">
+        <span>Επόμενο Pool / Στόχος Ρευστότητας:</span>
+        <span id="targetPoolVal" class="metric-val pos">--</span>
+      </div>
+      <div class="metric-row">
+        <span>Δομικός Έλεγχος Ζώνης:</span>
+        <span id="sweepBreakVal" class="metric-val">--</span>
+      </div>
+    </div>
+
+    <!-- HYPERLIQUID PAIN & CAPITAL SUMMARY ($) -->
+    <div class="card">
+      <div class="card-title">
+        <span>Capital Ratio ($) & Hyperliquid Pain</span>
+        <span id="hlFundingBadge" class="mono-badge">HL Funding: --</span>
+      </div>
+      <div class="metric-row">
+        <span>Κεφάλαια Υπέρ ($ Bullish Flow/OI):</span>
+        <span id="bullCapVal" class="metric-val pos">--</span>
+      </div>
+      <div class="metric-row">
+        <span>Κεφάλαια Κατά ($ Bearish Pressure):</span>
+        <span id="bearCapVal" class="metric-val neg">--</span>
+      </div>
+      <div class="ratio-bar">
+        <div id="capRatioFill" class="ratio-fill"></div>
+      </div>
+      <div class="metric-row">
+        <span>Capital Ratio ($ Υπέρ vs $ Κατά):</span>
+        <span id="capRatioText" class="metric-val">--</span>
+      </div>
+      <div class="metric-row">
+        <span>Hyperliquid Pain (Ποιος Πληρώνει):</span>
+        <span id="hlPainText" class="metric-val">--</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- BOTTOM: MULTI-TF SNAPSHOT COMPARISON & EVENT LOG -->
+<section class="grid-bottom">
+  <div class="card">
+    <div class="card-title">
+      <span>Auto Snapshots CVD (Σύγκριση Τρέχον vs Προηγούμενο)</span>
+      <span id="snapClock" class="mono-badge">--</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>TF</th>
+          <th>Futures CVD</th>
+          <th>Δ vs Προηγ.</th>
+          <th>Spot CVD</th>
+          <th>Δ Spot</th>
+          <th>Ρυθμός</th>
+        </tr>
+      </thead>
+      <tbody id="cvdTableBody">
+        <tr><td colspan="6" class="empty-cell">Αναμονή δεδομένων...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      <span>Τι Άλλαξε (Μόνο Ουσιαστικά Γεγονότα)</span>
+      <span class="mono-badge small-note">No Spam Filter</span>
+    </div>
+    <div id="eventFeed" class="feed-list">
+      <div class="feed-item">
+        <div class="feed-meta">SYSTEM READY</div>
+        Καταγραφή μόνο όταν αλλάζει η κατεύθυνση ροής, η συμφωνία Spot–Perp ή η συμπεριφορά σε ζώνη.
+      </div>
+    </div>
+  </div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
