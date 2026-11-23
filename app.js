@@ -65,49 +65,63 @@ function calcCvdFromKlines(klines, bars) {
   return { delta, totalVol };
 }
 
-// Dynamic Support/Demand, Resistance & Pivots purely from price structure
+// Dynamic Support/Demand, Resistance & Pivots with minimum separation so levels don't clump
 function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
   const highs = klines.map(k => parseFloat(k[2]));
   const lows = klines.map(k => parseFloat(k[3]));
 
-  const recent = klines.slice(-64);
+  const recent = klines.slice(-96);
   const swingHighs = [];
   const swingLows = [];
 
-  for (let i = 2; i < recent.length - 2; i++) {
+  for (let i = 3; i < recent.length - 3; i++) {
     const h = parseFloat(recent[i][2]);
     const l = parseFloat(recent[i][3]);
-    if (
-      h > parseFloat(recent[i - 1][2]) && h > parseFloat(recent[i - 2][2]) &&
-      h >= parseFloat(recent[i + 1][2]) && h >= parseFloat(recent[i + 2][2])
-    ) {
-      swingHighs.push(h);
-    }
-    if (
-      l < parseFloat(recent[i - 1][3]) && l < parseFloat(recent[i - 2][3]) &&
-      l <= parseFloat(recent[i + 1][3]) && l <= parseFloat(recent[i + 2][3])
-    ) {
-      swingLows.push(l);
-    }
+    const isSwingHigh =
+      h >= parseFloat(recent[i - 1][2]) && h >= parseFloat(recent[i - 2][2]) && h >= parseFloat(recent[i - 3][2]) &&
+      h >= parseFloat(recent[i + 1][2]) && h >= parseFloat(recent[i + 2][2]) && h >= parseFloat(recent[i + 3][2]);
+    const isSwingLow =
+      l <= parseFloat(recent[i - 1][3]) && l <= parseFloat(recent[i - 2][3]) && l <= parseFloat(recent[i - 3][3]) &&
+      l <= parseFloat(recent[i + 1][3]) && l <= parseFloat(recent[i + 2][3]) && l <= parseFloat(recent[i + 3][3]);
+
+    if (isSwingHigh) swingHighs.push(h);
+    if (isSwingLow) swingLows.push(l);
   }
 
-  const supportsBelow = swingLows.filter(v => v < currentPrice).sort((a, b) => b - a);
-  const resistsAbove = swingHighs.filter(v => v > currentPrice).sort((a, b) => a - b);
+  const minBandGap = currentPrice * 0.0045; // ~0.45% minimum separation between distinct zones
 
-  const minLow = Math.min(...lows.slice(-64));
-  const maxHigh = Math.max(...highs.slice(-64));
+  const pickSeparated = (candidates, asc) => {
+    const sorted = [...candidates].sort((a, b) => asc ? a - b : b - a);
+    const chosen = [];
+    for (const val of sorted) {
+      if (chosen.every(existing => Math.abs(existing - val) >= minBandGap)) {
+        chosen.push(val);
+      }
+      if (chosen.length >= 2) break;
+    }
+    return chosen;
+  };
 
-  const demandTop = supportsBelow[0] || (currentPrice * 0.992);
-  const demandBottom = supportsBelow[1] || minLow;
-  const supplyBottom = resistsAbove[0] || (currentPrice * 1.008);
-  const supplyTop = resistsAbove[1] || maxHigh;
+  const supportsBelow = pickSeparated(swingLows.filter(v => v < currentPrice * 0.9985), false);
+  const resistsAbove = pickSeparated(swingHighs.filter(v => v > currentPrice * 1.0015), true);
 
-  const atrApprox = (maxHigh - minLow) / 14;
+  const minLow = Math.min(...lows.slice(-96));
+  const maxHigh = Math.max(...highs.slice(-96));
+  const span = Math.max(maxHigh - minLow, currentPrice * 0.015);
+
+  const demandTop = supportsBelow[0] ?? (currentPrice - span * 0.25);
+  const demandBottom = supportsBelow[1] ?? Math.max(minLow, demandTop - span * 0.22);
+
+  const supplyBottom = resistsAbove[0] ?? (currentPrice + span * 0.25);
+  const supplyTop = resistsAbove[1] ?? Math.min(maxHigh, supplyBottom + span * 0.22);
+
+  // Soft Pivot sits cleanly between current price and demandTop (or supplyBottom if below demand)
   const softPivot = currentPrice >= demandTop
-    ? Math.max(demandTop, currentPrice - atrApprox * 0.65)
-    : Math.min(supplyBottom, currentPrice + atrApprox * 0.65);
+    ? Math.max(demandTop + minBandGap * 0.4, currentPrice - span * 0.12)
+    : Math.min(supplyBottom - minBandGap * 0.4, currentPrice + span * 0.12);
 
-  const hardPivot = demandBottom;
+  // Hard Pivot sits at the base of the primary demand zone
+  const hardPivot = Math.min(demandBottom, demandTop - minBandGap * 0.6);
 
   const lastBar = klines[klines.length - 1];
   const lastLow = parseFloat(lastBar[3]);
@@ -186,39 +200,43 @@ function drawChart(klines, struct) {
 
   const w = rect.width;
   const h = rect.height;
-  const padR = 74;
-  const plotW = w - padR;
+  const padR = 82;
+  const plotW = Math.max(60, w - padR);
 
-  const view = klines.slice(-60);
+  const view = klines.slice(-64);
   const highs = view.map(k => parseFloat(k[2]));
   const lows = view.map(k => parseFloat(k[3]));
-  const maxP = Math.max(...highs, struct.supplyTop) * 1.0015;
-  const minP = Math.min(...lows, struct.hardPivot) * 0.9985;
+  const maxP = Math.max(...highs, struct.supplyTop) * 1.002;
+  const minP = Math.min(...lows, struct.hardPivot) * 0.998;
   const range = maxP - minP || 1;
 
-  const yOf = (price) => h - ((price - minP) / range) * (h - 24) - 12;
+  const yOf = (price) => h - ((price - minP) / range) * (h - 28) - 14;
 
   ctx.clearRect(0, 0, w, h);
 
+  // Demand Zone band
   const yDemTop = yOf(struct.demandTop);
   const yDemBot = yOf(struct.demandBottom);
-  ctx.fillStyle = 'rgba(16, 185, 129, 0.12)';
-  ctx.fillRect(0, yDemTop, plotW, Math.max(4, yDemBot - yDemTop));
+  ctx.fillStyle = 'rgba(16, 185, 129, 0.14)';
+  ctx.fillRect(0, Math.min(yDemTop, yDemBot), plotW, Math.max(8, Math.abs(yDemBot - yDemTop)));
 
+  // Resistance / Liquidity Pool band
   const ySupTop = yOf(struct.supplyTop);
   const ySupBot = yOf(struct.supplyBottom);
-  ctx.fillStyle = 'rgba(239, 68, 68, 0.10)';
-  ctx.fillRect(0, ySupTop, plotW, Math.max(4, ySupBot - ySupTop));
+  ctx.fillStyle = 'rgba(239, 68, 68, 0.12)';
+  ctx.fillRect(0, Math.min(ySupTop, ySupBot), plotW, Math.max(8, Math.abs(ySupBot - ySupTop)));
 
+  // Soft Pivot dashed line
   const ySoft = yOf(struct.softPivot);
   ctx.strokeStyle = '#f59e0b';
   ctx.setLineDash([5, 4]);
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1.1;
   ctx.beginPath();
   ctx.moveTo(0, ySoft);
   ctx.lineTo(plotW, ySoft);
   ctx.stroke();
 
+  // Hard Pivot solid line
   const yHard = yOf(struct.hardPivot);
   ctx.strokeStyle = '#ef4444';
   ctx.setLineDash([]);
@@ -228,6 +246,7 @@ function drawChart(klines, struct) {
   ctx.lineTo(plotW, yHard);
   ctx.stroke();
 
+  // Candlesticks
   const step = plotW / view.length;
   const candleW = Math.max(2, step * 0.62);
   view.forEach((k, i) => {
@@ -250,6 +269,7 @@ function drawChart(klines, struct) {
     ctx.fillRect(x - candleW / 2, top, candleW, Math.max(1.5, bot - top));
   });
 
+  // Right price labels with anti-overlap spacing
   ctx.font = '11px monospace';
   ctx.textAlign = 'left';
   const labels = [
@@ -257,11 +277,16 @@ function drawChart(klines, struct) {
     { p: struct.softPivot, color: '#fbbf24', tag: 'S-PIV' },
     { p: struct.demandTop, color: '#34d399', tag: 'DEM' },
     { p: struct.hardPivot, color: '#ef4444', tag: 'H-PIV' }
-  ];
+  ]
+    .map(lb => ({ ...lb, y: yOf(lb.p) }))
+    .sort((a, b) => a.y - b.y);
+
+  let lastLabelY = -999;
   labels.forEach(lb => {
-    const y = yOf(lb.p);
+    const drawY = Math.max(lb.y + 3, lastLabelY + 14);
+    lastLabelY = drawY - 3;
     ctx.fillStyle = lb.color;
-    ctx.fillText(`${lb.tag} ${Math.round(lb.p)}`, plotW + 4, y + 3);
+    ctx.fillText(`${lb.tag} ${Math.round(lb.p)}`, plotW + 4, Math.min(h - 6, drawY));
   });
 }
 
@@ -276,9 +301,9 @@ async function runCycle() {
 
   try {
     const [fut15Res, fut1hRes, spot15Res, spot1hRes, hlData] = await Promise.all([
-      fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=15m&limit=96`),
+      fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=15m&limit=120`),
       fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=1h&limit=48`),
-      fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=15m&limit=96`),
+      fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=15m&limit=120`),
       fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=1h&limit=48`),
       fetchHyperliquidPain(baseCoin)
     ]);
@@ -314,10 +339,10 @@ async function runCycle() {
       let pace = 'Σταθερό';
       let paceCls = '';
       if (prev) {
-        if (t.fut.delta > 0 && dFut > 250000) { pace = 'Επιταχύνει ↑'; paceCls = 'pos'; }
-        else if (t.fut.delta > 0 && dFut < -250000) { pace = 'Μαλακώνει ↓'; paceCls = 'warn-txt'; }
-        else if (t.fut.delta < 0 && dFut < -250000) { pace = 'Πιέζει κάτω ↓'; paceCls = 'neg'; }
-        else if (t.fut.delta < 0 && dFut > 250000) { pace = 'Απορρόφηση ↑'; paceCls = 'pos'; }
+        if (t.fut.delta > 0 && dFut > 350000) { pace = 'Επιταχύνει ↑'; paceCls = 'pos'; }
+        else if (t.fut.delta > 0 && dFut < -350000) { pace = 'Μαλακώνει ↓'; paceCls = 'warn-txt'; }
+        else if (t.fut.delta < 0 && dFut < -350000) { pace = 'Πιέζει κάτω ↓'; paceCls = 'neg'; }
+        else if (t.fut.delta < 0 && dFut > 350000) { pace = 'Απορρόφηση ↑'; paceCls = 'pos'; }
       }
       return `
         <tr>
@@ -350,29 +375,42 @@ async function runCycle() {
       <span>■ Liquidity Pool: $${fmtPrice(struct.supplyBottom)} – $${fmtPrice(struct.supplyTop)}</span>
     `;
 
+    // Hyperliquid Pain & Capital Ratio ($) with broader 4h+1D flow + OI context
     let hlPain = 'Ουδέτερο funding (χωρίς ακραίο πόνο)';
-    let hlBiasBull = 0;
-    let hlBiasBear = 0;
+    let hlBullWeight = 0;
+    let hlBearWeight = 0;
     if (hlData) {
       const ann = hlData.annualizedPct;
       document.getElementById('hlFundingBadge').textContent =
         `HL Funding: ${(hlData.fundingHourly * 100).toFixed(4)}%/h (${ann.toFixed(1)}% APR)`;
       if (hlData.fundingHourly < -0.00005) {
         hlPain = `Πονάνε οι SHORTS (πληρώνουν longs · OI ${fmtUsd(hlData.oiUsd)})`;
-        hlBiasBull = hlData.oiUsd * 0.12;
+        hlBullWeight = hlData.oiUsd * 0.08;
       } else if (hlData.fundingHourly > 0.00015) {
         hlPain = `Πονάνε οι LONGS (ακριβό funding · OI ${fmtUsd(hlData.oiUsd)})`;
-        hlBiasBear = hlData.oiUsd * 0.12;
+        hlBearWeight = hlData.oiUsd * 0.08;
       } else {
         hlPain = `Ισορροπημένο funding · HL OI: ${fmtUsd(hlData.oiUsd)}`;
       }
     }
     document.getElementById('hlPainText').textContent = hlPain;
 
-    const bullCap = Math.max(0, snapNow['4h'].fut) + Math.max(0, snapNow['4h'].spot) * 2 + hlBiasBull + 1;
-    const bearCap = Math.max(0, -snapNow['4h'].fut) + Math.max(0, -snapNow['4h'].spot) * 2 + hlBiasBear + 1;
-    const bullShare = (bullCap / (bullCap + bearCap)) * 100;
-    const ratio = (bullCap / bearCap).toFixed(2);
+    const bullCap =
+      Math.max(0, snapNow['4h'].fut) +
+      Math.max(0, snapNow['1D'].fut * 0.35) +
+      Math.max(0, snapNow['4h'].spot) * 2 +
+      hlBullWeight;
+
+    const bearCap =
+      Math.max(0, -snapNow['4h'].fut) +
+      Math.max(0, -snapNow['1D'].fut * 0.35) +
+      Math.max(0, -snapNow['4h'].spot) * 2 +
+      hlBearWeight;
+
+    const safeBull = bullCap > 0 ? bullCap : 100000;
+    const safeBear = bearCap > 0 ? bearCap : 100000;
+    const bullShare = (safeBull / (safeBull + safeBear)) * 100;
+    const ratio = (safeBull / safeBear).toFixed(2);
 
     document.getElementById('bullCapVal').textContent = fmtUsd(bullCap);
     document.getElementById('bearCapVal').textContent = fmtUsd(bearCap);
@@ -380,6 +418,7 @@ async function runCycle() {
     document.getElementById('capRatioText').textContent =
       `${ratio} : 1 (${bullShare.toFixed(0)}% Υπέρ / ${(100 - bullShare).toFixed(0)}% Κατά)`;
 
+    // Situation Summary (Updates ONLY when regime/flow meaningfully changes)
     const f1h = snapNow['1h'].fut;
     const s1h = snapNow['1h'].spot;
     const dF1h = prev ? (f1h - prev['1h'].fut) : 0;
@@ -408,7 +447,7 @@ async function runCycle() {
       headline = `Ασυμφωνία Futures CVD με Spot — η άνοδος πατάει σε μόχλευση`;
       detail = `Τα Futures δείχνουν θετικό Delta (${fmtUsd(f1h)}), αλλά το Spot δεν ακολουθεί (${fmtUsd(s1h)}). Προσοχή σε απότομο σκούπισμα προς τη ζώνη Demand ($${fmtPrice(struct.demandTop)}) πριν υπάρξει καθαρή συνέχεια.`;
       syncLabel = 'Ασυμφωνία: Perps ↑ / Spot ↓';
-    } else if (f1h > 0 && dF1h < -350000) {
+    } else if (f1h > 0 && dF1h < -400000) {
       regime = 'MOMENTUM_COOLING';
       cardClass = 'summary-card warn';
       headline = `Μαλακώνει η θετική εισροή στο CVD — η κίνηση χάνει φόρα (Μαλακό Pivot $${fmtPrice(struct.softPivot)})`;
