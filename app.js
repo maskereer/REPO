@@ -7,7 +7,6 @@ const state = {
   prevPrice: null,
   klines15m: [],
   prevCvdSnap: null,
-  prevSwingCvd: null,
   perVenuePrev: {}, // { BN: snap, BB: snap, OKX: snap }
   lastSummarySignature: '',
   events: []
@@ -70,8 +69,62 @@ function calcBinanceCvdFromKlines(klines, bars, startIndex = null) {
   return { delta, totalVol, count: slice.length };
 }
 
-// Directional flow estimate for exchanges without taker-buy field in candles
-// Bybit kline format: [startTime, open, high, low, close, volume, turnover]
+// Analyze 5m candle weight (volume vs 1h average) & absorption (heavy flow with minimal price move)
+function analyze5mFlowQuality(fut5m, spot5m) {
+  if (!Array.isArray(fut5m) || fut5m.length < 2) {
+    return {
+      fut: 0,
+      spot: 0,
+      weightMult: 1,
+      volRatio: 1,
+      qualityTag: 'Κανονικό',
+      isAbsorption: false
+    };
+  }
+
+  const last = fut5m[fut5m.length - 1];
+  const last1hSlice = fut5m.slice(-13, -1);
+  const avgVol = last1hSlice.length
+    ? last1hSlice.reduce((acc, k) => acc + (parseFloat(k[7]) || 0), 0) / last1hSlice.length
+    : (parseFloat(last[7]) || 1);
+
+  const lastQuoteVol = parseFloat(last[7]) || 0;
+  const volRatio = avgVol > 0 ? lastQuoteVol / avgVol : 1;
+
+  const o = parseFloat(last[1]) || 1;
+  const c = parseFloat(last[4]) || o;
+  const movePct = Math.abs((c - o) / o) * 100;
+
+  const futDelta = calcBinanceCvdFromKlines(fut5m, 1).delta;
+  const spotDelta = Array.isArray(spot5m) && spot5m.length ? calcBinanceCvdFromKlines(spot5m, 1).delta : 0;
+
+  const heavyFlow = volRatio >= 1.4 && Math.abs(futDelta) >= 400000;
+  const isAbsorption = Math.abs(futDelta) >= 600000 && movePct < 0.08;
+
+  let weightMult = 1.0;
+  let qualityTag = 'Κανονικό';
+
+  if (isAbsorption) {
+    weightMult = 1.35;
+    qualityTag = 'Απορρόφηση';
+  } else if (heavyFlow) {
+    weightMult = 1.30;
+    qualityTag = `Βαρύ ×${volRatio.toFixed(1)}`;
+  } else if (volRatio < 0.75) {
+    weightMult = 0.70;
+    qualityTag = 'Ελαφρύ';
+  }
+
+  return {
+    fut: futDelta,
+    spot: spotDelta,
+    weightMult,
+    volRatio,
+    qualityTag,
+    isAbsorption
+  };
+}
+
 function calcBybitFlowFromKlines(list, bars, startIndex = null) {
   if (!Array.isArray(list) || !list.length) return null;
   const slice = startIndex !== null
@@ -93,7 +146,6 @@ function calcBybitFlowFromKlines(list, bars, startIndex = null) {
   return { delta, totalVol, count: slice.length };
 }
 
-// OKX candle format: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
 function calcOkxFlowFromKlines(list, bars, startIndex = null) {
   if (!Array.isArray(list) || !list.length) return null;
   const slice = startIndex !== null
@@ -115,40 +167,112 @@ function calcOkxFlowFromKlines(list, bars, startIndex = null) {
   return { delta, totalVol, count: slice.length };
 }
 
-// Find latest meaningful swing point in 15m klines so Swing-to-Now CVD measures a real move
-function detectLatestSwingAnchor(klines15m) {
+// Compute adaptive lookback window (20..72 x 15m bars) based on recent range & choppiness
+function getAdaptiveWindowConfig(klines15m) {
   const n = klines15m.length;
-  if (n < 10) {
+  const currentPrice = parseFloat(klines15m[n - 1]?.[4] || 1);
+  const recent24 = klines15m.slice(-24);
+  const hi24 = Math.max(...recent24.map(k => parseFloat(k[2])));
+  const lo24 = Math.min(...recent24.map(k => parseFloat(k[3])));
+  const rangePct24 = currentPrice > 0 ? (hi24 - lo24) / currentPrice : 0.02;
+
+  let flips = 0;
+  let prevDir = 0;
+  for (let i = Math.max(1, n - 16); i < n; i++) {
+    const diff = parseFloat(klines15m[i][4]) - parseFloat(klines15m[i - 1][4]);
+    const dir = diff > 0 ? 1 : (diff < 0 ? -1 : 0);
+    if (dir !== 0 && prevDir !== 0 && dir !== prevDir) flips++;
+    if (dir !== 0) prevDir = dir;
+  }
+
+  let windowBars = 40;
+  let modeLabel = 'Κανονικό';
+
+  if (rangePct24 < 0.014 && flips <= 8) {
+    windowBars = 68;
+    modeLabel = 'Πλάγιο/Εύρος';
+  } else if (rangePct24 > 0.034 || flips >= 11) {
+    windowBars = 22;
+    modeLabel = 'Νευρικό/Κύματα';
+  } else {
+    const normRange = Math.max(0, Math.min(1, (0.034 - rangePct24) / 0.02));
+    windowBars = Math.round(24 + normRange * 40);
+    modeLabel = 'Δυναμικό';
+  }
+
+  windowBars = Math.max(20, Math.min(Math.min(72, n), windowBars));
+  const minSwingPct = rangePct24 > 0.032 ? 0.0045 : (rangePct24 < 0.014 ? 0.0025 : 0.0032);
+
+  return { windowBars, minSwingPct, modeLabel, rangePct24 };
+}
+
+function extractAdaptiveSwingPoints(klines15m, cfg = null) {
+  const activeCfg = cfg || getAdaptiveWindowConfig(klines15m);
+  const offset = Math.max(0, klines15m.length - activeCfg.windowBars);
+  const win = klines15m.slice(offset);
+  const m = win.length;
+  const highs = [];
+  const lows = [];
+
+  for (let i = 2; i < m - 2; i++) {
+    const h = parseFloat(win[i][2]);
+    const l = parseFloat(win[i][3]);
+    const isHigh =
+      h >= parseFloat(win[i - 1][2]) && h >= parseFloat(win[i - 2][2]) &&
+      h >= parseFloat(win[i + 1][2]) && h >= parseFloat(win[i + 2][2]);
+    const isLow =
+      l <= parseFloat(win[i - 1][3]) && l <= parseFloat(win[i - 2][3]) &&
+      l <= parseFloat(win[i + 1][3]) && l <= parseFloat(win[i + 2][3]);
+
+    const globalIdx = offset + i;
+    if (isHigh) highs.push({ type: 'HIGH', price: h, index: globalIdx, barsAgo: klines15m.length - 1 - globalIdx });
+    if (isLow) lows.push({ type: 'LOW', price: l, index: globalIdx, barsAgo: klines15m.length - 1 - globalIdx });
+  }
+
+  const filterSwings = (arr) => {
+    const res = [];
+    for (const pt of arr) {
+      if (!res.length) {
+        res.push(pt);
+        continue;
+      }
+      const prev = res[res.length - 1];
+      if (Math.abs(pt.price - prev.price) / prev.price >= activeCfg.minSwingPct) {
+        res.push(pt);
+      } else {
+        if (pt.type === 'HIGH' && pt.price > prev.price) res[res.length - 1] = pt;
+        if (pt.type === 'LOW' && pt.price < prev.price) res[res.length - 1] = pt;
+      }
+    }
+    return res;
+  };
+
+  return {
+    sigHighs: filterSwings(highs),
+    sigLows: filterSwings(lows),
+    windowStartIdx: offset,
+    cfg: activeCfg
+  };
+}
+
+function detectLatestSwingAnchor(klines15m, precomputed = null) {
+  const n = klines15m.length;
+  if (n < 8) {
     return { type: 'INIT', price: parseFloat(klines15m[0]?.[3] || 0), index: 0, barsAgo: n };
   }
   const currentPrice = parseFloat(klines15m[n - 1][4]);
-  const minMovePct = 0.0065; // 0.65% minimum move to avoid micro-noise swings
+  const { sigHighs, sigLows, windowStartIdx, cfg } = precomputed || extractAdaptiveSwingPoints(klines15m);
+  const combined = [...sigHighs, ...sigLows].sort((a, b) => a.index - b.index);
 
-  const candidates = [];
-  for (let i = 2; i < n - 2; i++) {
-    const h = parseFloat(klines15m[i][2]);
-    const l = parseFloat(klines15m[i][3]);
-    const isHigh =
-      h >= parseFloat(klines15m[i - 1][2]) && h >= parseFloat(klines15m[i - 2][2]) &&
-      h >= parseFloat(klines15m[i + 1][2]) && h >= parseFloat(klines15m[i + 2][2]);
-    const isLow =
-      l <= parseFloat(klines15m[i - 1][3]) && l <= parseFloat(klines15m[i - 2][3]) &&
-      l <= parseFloat(klines15m[i + 1][3]) && l <= parseFloat(klines15m[i + 2][3]);
-
-    if (isHigh) candidates.push({ type: 'HIGH', price: h, index: i });
-    if (isLow) candidates.push({ type: 'LOW', price: l, index: i });
-  }
-
-  for (let idx = candidates.length - 1; idx >= 0; idx--) {
-    const c = candidates[idx];
+  for (let idx = combined.length - 1; idx >= 0; idx--) {
+    const c = combined[idx];
     const moveRatio = Math.abs(currentPrice - c.price) / Math.max(c.price, 1);
-    if (moveRatio >= minMovePct && (n - 1 - c.index) >= 2) {
-      return { ...c, barsAgo: n - 1 - c.index };
+    if (moveRatio >= cfg.minSwingPct && c.barsAgo >= 2) {
+      return c;
     }
   }
 
-  // Fallback to extreme low/high over last 24 candles (6h)
-  const lookbackStart = Math.max(0, n - 24);
+  const lookbackStart = Math.max(windowStartIdx, n - Math.max(12, Math.round(cfg.windowBars * 0.5)));
   let bestLow = { price: Infinity, index: lookbackStart };
   let bestHigh = { price: -Infinity, index: lookbackStart };
   for (let i = lookbackStart; i < n; i++) {
@@ -157,17 +281,97 @@ function detectLatestSwingAnchor(klines15m) {
     if (l < bestLow.price) bestLow = { price: l, index: i };
     if (h > bestHigh.price) bestHigh = { price: h, index: i };
   }
-
-  const distLow = Math.abs(currentPrice - bestLow.price);
-  const distHigh = Math.abs(bestHigh.price - currentPrice);
-  const chosen = distLow <= distHigh
+  const chosen = Math.abs(currentPrice - bestLow.price) <= Math.abs(bestHigh.price - currentPrice)
     ? { type: 'LOW', price: bestLow.price, index: bestLow.index }
     : { type: 'HIGH', price: bestHigh.price, index: bestHigh.index };
 
   return { ...chosen, barsAgo: Math.max(1, n - 1 - chosen.index) };
 }
 
-// Map 15m swing index into Bybit/OKX 15m candle arrays by timestamp
+function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, deltaNow, hlData, precomputed = null) {
+  const { sigHighs, sigLows, cfg } = precomputed || extractAdaptiveSwingPoints(klines15m);
+  const slice = klines15m.slice(-cfg.windowBars);
+  const fallbackHigh = Math.max(...slice.map(k => parseFloat(k[2])));
+  const fallbackLow = Math.min(...slice.map(k => parseFloat(k[3])));
+
+  const lastHigh = sigHighs[sigHighs.length - 1] || { price: fallbackHigh, barsAgo: 1 };
+  const prevHigh = sigHighs[sigHighs.length - 2] || null;
+  const lastLow = sigLows[sigLows.length - 1] || { price: fallbackLow, barsAgo: 1 };
+  const prevLow = sigLows[sigLows.length - 2] || null;
+
+  const highTrend = prevHigh ? (lastHigh.price > prevHigh.price ? 'HH' : 'LH') : 'SWG-H';
+  const lowTrend = prevLow ? (lastLow.price > prevLow.price ? 'HL' : 'LL') : 'SWG-L';
+
+  const span = Math.max(lastHigh.price - lastLow.price, currentPrice * 0.004);
+  const posInCorridor = Math.max(0, Math.min(1, (currentPrice - lastLow.price) / span));
+
+  const fSw = snapNow['SWING'].fut;
+  const sSw = snapNow['SWING'].spot;
+  const f15 = snapNow['15m'].fut;
+  const f1h = snapNow['1h'].fut;
+  const f4h = snapNow['4h'].fut;
+  const dF15 = deltaNow['15m']?.fut ?? 0;
+  const f5Weighted = m5Snap.fut * m5Snap.weightMult;
+
+  const hlShortSqueezeBias = hlData && hlData.fundingHourly < -0.00005;
+  const hlLongHeavyBias = hlData && hlData.fundingHourly > 0.00015;
+
+  const macroBearish = f4h < 0 || (f1h < 0 && posInCorridor <= 0.5);
+  const sellingEasing = (f5Weighted > 0 || m5Snap.isAbsorption || dF15 > 250000 || (fSw > 0 && lowTrend === 'HL'));
+  const buyingEasing = (f5Weighted < 0 || dF15 < -250000 || (fSw < 0 && highTrend === 'LH'));
+
+  let mapSignal = 'MID_CORRIDOR';
+  let mapHeadline = '';
+  let mapAdvice = '';
+  let mapScoreBias = 0;
+
+  if (macroBearish && posInCorridor <= 0.45 && sellingEasing) {
+    mapSignal = 'DROP_EXHAUSTION_ENTRY';
+    mapScoreBias = hlShortSqueezeBias ? 34 : 28;
+    mapHeadline = `Επιβράδυνση πτώσης κοντά στο ${lowTrend} ($${fmtPrice(lastLow.price)}) — έλεγχος εισόδου`;
+    mapAdvice = `Η ευρύτερη εικόνα είναι επιφυλακτική/πτωτική, αλλά η τοπική ροή μαλακώνει (5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}], 15m: ${fmtUsd(f15)}, SWG: ${fmtUsd(fSw)}).${hlShortSqueezeBias ? ' Στο HL πιέζονται shorts.' : ''} Ενδείκνυται έλεγχος εισόδου αντί για κυνηγητό σορτ.`;
+  } else if (currentPrice > lastHigh.price && fSw > 0 && f5Weighted >= -200000) {
+    mapSignal = 'BULL_BREAK_READY';
+    mapScoreBias = hlShortSqueezeBias ? 38 : 32;
+    mapHeadline = `Διάσπαση πάνω από ${highTrend} ($${fmtPrice(lastHigh.price)}) με καύσιμο CVD`;
+    mapAdvice = `Σπάσιμο τοπικής κορυφής με ροή κύματος (${fmtUsd(fSw)} Perp / ${fmtUsd(sSw)} Spot) και 5m [${m5Snap.qualityTag}].`;
+  } else if (currentPrice < lastLow.price && fSw < 0 && !sellingEasing) {
+    mapSignal = 'BEAR_BREAK_READY';
+    mapScoreBias = hlLongHeavyBias ? -38 : -32;
+    mapHeadline = `Διάσπαση κάτω από ${lowTrend} ($${fmtPrice(lastLow.price)}) με πίεση CVD`;
+    mapAdvice = `Πέρασμα κάτω από το τοπικό χαμηλό με αρνητική πίεση (${fmtUsd(fSw)} Perp, 5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}]).${hlLongHeavyBias ? ' Βαρύ funding longs στο HL.' : ''}`;
+  } else if (posInCorridor >= 0.65 && buyingEasing) {
+    mapSignal = 'RALLY_EXHAUSTION_WAIT';
+    mapScoreBias = hlLongHeavyBias ? -30 : -24;
+    mapHeadline = `Χάνει φόρα η άνοδος προς ${highTrend} ($${fmtPrice(lastHigh.price)}) — πιθανό LH / αναμονή`;
+    mapAdvice = `Η τιμή είναι κοντά στην κορυφή του διαδρόμου (${Math.round(posInCorridor * 100)}%), αλλά η άμεση ροή επιβραδύνει (5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}], 15m: ${fmtUsd(f15)}). Αναμονή για επανεξέταση.`;
+  } else if (posInCorridor <= 0.35 && !sellingEasing) {
+    mapSignal = 'BEAR_BREAK_READY';
+    mapScoreBias = -22;
+    mapHeadline = `Πίεση προς τοπικό χαμηλό $${fmtPrice(lastLow.price)} χωρίς ένδειξη φρεναρίσματος`;
+    mapAdvice = `Οι πωλητές διατηρούν ρυθμό (5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}], 15m: ${fmtUsd(f15)}). Καλύτερα να φανεί επιβράδυνση πριν από κόντρα είσοδο.`;
+  } else {
+    mapSignal = 'MID_CORRIDOR';
+    mapScoreBias = 0;
+    mapHeadline = `Διάδρομος $${fmtPrice(lastLow.price)} (${lowTrend}) ↔ $${fmtPrice(lastHigh.price)} (${highTrend})`;
+    mapAdvice = `Η τιμή βρίσκεται στο ${Math.round(posInCorridor * 100)}% του δυναμικού διαδρόμου (${cfg.windowBars}×15m · ${cfg.modeLabel} · 5m ${m5Snap.qualityTag}).`;
+  }
+
+  return {
+    lastHigh: lastHigh.price,
+    lastLow: lastLow.price,
+    highTrend,
+    lowTrend,
+    posInCorridor,
+    mapSignal,
+    mapHeadline,
+    mapAdvice,
+    mapScoreBias,
+    windowBars: cfg.windowBars,
+    modeLabel: cfg.modeLabel
+  };
+}
+
 function findStartIndexByTs(list, anchorTs, tsExtractor) {
   if (!Array.isArray(list) || !list.length || !anchorTs) return null;
   const idx = list.findIndex(k => tsExtractor(k) >= anchorTs);
@@ -237,12 +441,12 @@ async function fetchOkxData(sym, anchorTs = null) {
   }
 }
 
-// Dynamic Support/Demand, Resistance & Pivots with minimum separation so levels don't clump
-function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
+function computeDynamicStructure(klines, currentPrice, cvd1hDelta, windowBars = 48) {
   const highs = klines.map(k => parseFloat(k[2]));
   const lows = klines.map(k => parseFloat(k[3]));
+  const lookback = Math.max(24, Math.min(klines.length, windowBars));
 
-  const recent = klines.slice(-96);
+  const recent = klines.slice(-lookback);
   const swingHighs = [];
   const swingLows = [];
 
@@ -260,7 +464,7 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
     if (isSwingLow) swingLows.push(l);
   }
 
-  const minBandGap = currentPrice * 0.0045;
+  const minBandGap = currentPrice * 0.004;
 
   const pickSeparated = (candidates, asc) => {
     const sorted = [...candidates].sort((a, b) => asc ? a - b : b - a);
@@ -277,9 +481,9 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
   const supportsBelow = pickSeparated(swingLows.filter(v => v < currentPrice * 0.9985), false);
   const resistsAbove = pickSeparated(swingHighs.filter(v => v > currentPrice * 1.0015), true);
 
-  const minLow = Math.min(...lows.slice(-96));
-  const maxHigh = Math.max(...highs.slice(-96));
-  const span = Math.max(maxHigh - minLow, currentPrice * 0.015);
+  const minLow = Math.min(...lows.slice(-lookback));
+  const maxHigh = Math.max(...highs.slice(-lookback));
+  const span = Math.max(maxHigh - minLow, currentPrice * 0.012);
 
   const demandTop = supportsBelow[0] ?? (currentPrice - span * 0.25);
   const demandBottom = supportsBelow[1] ?? Math.max(minLow, demandTop - span * 0.22);
@@ -321,8 +525,7 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta) {
   };
 }
 
-// Weighted Score (-100..+100): 40% Structure, 35% Macro Flow (1h/4h), 25% Immediate Move (5m + Swing CVD)
-function computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, currentPrice) {
+function computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, swingMap, currentPrice) {
   const f15 = snapNow['15m'].fut;
   const s15 = snapNow['15m'].spot;
   const f1h = snapNow['1h'].fut;
@@ -332,7 +535,6 @@ function computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, currentP
   const fSw = snapNow['SWING'].fut;
   const sSw = snapNow['SWING'].spot;
 
-  // 1) Structure score (-100..+100) -> 40%
   let structScore = 0;
   if (currentPrice < struct.hardPivot) structScore = -90;
   else if (currentPrice < struct.demandBottom) structScore = -60;
@@ -341,38 +543,33 @@ function computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, currentP
   else if (currentPrice >= struct.softPivot) structScore = 30;
   else structScore = -15;
 
-  // 2) Broader 1h/4h Perp+Spot flow score (-100..+100) -> 35%
   const macroNorm = Math.max(15000000, Math.abs(f4h) * 0.8 + Math.abs(f1h) * 2.5);
   const macroRaw = (f1h * 0.55 + s1h * 1.15 + f4h * 0.45 + s4h * 0.9) / macroNorm;
   const macroScore = Math.max(-100, Math.min(100, macroRaw * 100));
 
-  // 3) Immediate 5m + Swing-to-Now flow score (-100..+100) -> 25%
-  const moveNorm = Math.max(8000000, Math.abs(fSw) * 0.9 + Math.abs(m5Snap.fut) * 4);
-  const moveRaw = (m5Snap.fut * 1.4 + m5Snap.spot * 2.2 + fSw * 0.65 + sSw * 1.2 + f15 * 0.4 + s15 * 0.8) / moveNorm;
-  const moveScore = Math.max(-100, Math.min(100, moveRaw * 100));
+  const w5Fut = m5Snap.fut * m5Snap.weightMult;
+  const w5Spot = m5Snap.spot * m5Snap.weightMult;
+  const moveNorm = Math.max(6000000, Math.abs(fSw) * 0.9 + Math.abs(w5Fut) * 4);
+  const flowComponent = ((w5Fut * 1.5 + w5Spot * 2.2 + fSw * 0.65 + sSw * 1.2 + f15 * 0.45 + s15 * 0.8) / moveNorm) * 70;
+  const mapScore = Math.max(-100, Math.min(100, flowComponent + swingMap.mapScoreBias));
 
-  const totalScore = Math.round(structScore * 0.40 + macroScore * 0.35 + moveScore * 0.25);
+  const totalScore = Math.round(structScore * 0.35 + macroScore * 0.30 + mapScore * 0.35);
 
-  const reasons = [];
-  if (swingAnchor && swingAnchor.type !== 'INIT') {
-    const dirTxt = swingAnchor.type === 'LOW' ? 'χαμηλού' : 'υψηλού';
-    reasons.push(
-      `Από το τελευταίο τοπικό ${dirTxt} ($${fmtPrice(swingAnchor.price)}, ${swingAnchor.barsAgo}×15m): Perp ${fmtUsd(fSw)} / Spot ${fmtUsd(sSw)}`
-    );
-  }
-  reasons.push(`5m άμεση ροή: Perp ${fmtUsd(m5Snap.fut)} / Spot ${fmtUsd(m5Snap.spot)}`);
-  reasons.push(`Στάθμιση: Δομή 40% (${structScore > 0 ? '+' : ''}${structScore}) · 1h/4h 35% (${macroScore > 0 ? '+' : ''}${Math.round(macroScore)}) · Κίνηση/5m 25% (${moveScore > 0 ? '+' : ''}${Math.round(moveScore)})`);
+  const reasons = [
+    `Φακός ${swingMap.windowBars}×15m (${swingMap.modeLabel}): ${swingMap.lowTrend} $${fmtPrice(swingMap.lastLow)} ↔ ${swingMap.highTrend} $${fmtPrice(swingMap.lastHigh)} (${Math.round(swingMap.posInCorridor * 100)}%)`,
+    `Από ${swingAnchor.type === 'LOW' ? 'χαμηλό' : 'υψηλό'} $${fmtPrice(swingAnchor.price)}: Perp ${fmtUsd(fSw)} / Spot ${fmtUsd(sSw)} · 5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}]`,
+    `Βάρη: Δομή 35% (${structScore > 0 ? '+' : ''}${structScore}) · 1h/4h 30% (${macroScore > 0 ? '+' : ''}${Math.round(macroScore)}) · Φακός 35% (${mapScore > 0 ? '+' : ''}${Math.round(mapScore)})`
+  ];
 
   return {
     totalScore,
     structScore,
     macroScore,
-    moveScore,
+    mapScore,
     reasonText: reasons.join(' · ')
   };
 }
 
-// Adaptive Capital Ratio ($) — dynamically shifts weights between 15m/1h and 4h/1D based on activity & flow
 function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlData, activeVenues) {
   const f15 = snapNow['15m'].fut;
   const s15 = snapNow['15m'].spot;
@@ -481,7 +678,7 @@ function pushEvent(title, body) {
   `).join('');
 }
 
-function drawChart(klines, struct) {
+function drawChart(klines, struct, swingMap = null) {
   const canvas = document.getElementById('radarCanvas');
   const rect = canvas.parentElement.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -492,14 +689,18 @@ function drawChart(klines, struct) {
 
   const w = rect.width;
   const h = rect.height;
-  const padR = 82;
+  const padR = 86;
   const plotW = Math.max(60, w - padR);
 
-  const view = klines.slice(-64);
+  const viewBars = swingMap?.windowBars ? Math.min(klines.length, swingMap.windowBars) : 48;
+  const view = klines.slice(-viewBars);
   const highs = view.map(k => parseFloat(k[2]));
   const lows = view.map(k => parseFloat(k[3]));
-  const maxP = Math.max(...highs, struct.supplyTop) * 1.002;
-  const minP = Math.min(...lows, struct.hardPivot) * 0.998;
+  const extraHighs = swingMap ? [struct.supplyTop, swingMap.lastHigh] : [struct.supplyTop];
+  const extraLows = swingMap ? [struct.hardPivot, swingMap.lastLow] : [struct.hardPivot];
+
+  const maxP = Math.max(...highs, ...extraHighs) * 1.002;
+  const minP = Math.min(...lows, ...extraLows) * 0.998;
   const range = maxP - minP || 1;
 
   const yOf = (price) => h - ((price - minP) / range) * (h - 28) - 14;
@@ -515,6 +716,22 @@ function drawChart(klines, struct) {
   const ySupBot = yOf(struct.supplyBottom);
   ctx.fillStyle = 'rgba(239, 68, 68, 0.12)';
   ctx.fillRect(0, Math.min(ySupTop, ySupBot), plotW, Math.max(8, Math.abs(ySupBot - ySupTop)));
+
+  if (swingMap) {
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.65)';
+    ctx.setLineDash([3, 3]);
+    ctx.lineWidth = 1.0;
+
+    ctx.beginPath();
+    ctx.moveTo(0, yOf(swingMap.lastHigh));
+    ctx.lineTo(plotW, yOf(swingMap.lastHigh));
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(0, yOf(swingMap.lastLow));
+    ctx.lineTo(plotW, yOf(swingMap.lastLow));
+    ctx.stroke();
+  }
 
   const ySoft = yOf(struct.softPivot);
   ctx.strokeStyle = '#f59e0b';
@@ -556,23 +773,29 @@ function drawChart(klines, struct) {
     ctx.fillRect(x - candleW / 2, top, candleW, Math.max(1.5, bot - top));
   });
 
-  ctx.font = '11px monospace';
+  ctx.font = '10px monospace';
   ctx.textAlign = 'left';
   const labels = [
     { p: struct.supplyBottom, color: '#f87171', tag: 'POOL' },
     { p: struct.softPivot, color: '#fbbf24', tag: 'S-PIV' },
     { p: struct.demandTop, color: '#34d399', tag: 'DEM' },
     { p: struct.hardPivot, color: '#ef4444', tag: 'H-PIV' }
-  ]
+  ];
+  if (swingMap) {
+    labels.push({ p: swingMap.lastHigh, color: '#38bdf8', tag: swingMap.highTrend });
+    labels.push({ p: swingMap.lastLow, color: '#38bdf8', tag: swingMap.lowTrend });
+  }
+
+  const sortedLabels = labels
     .map(lb => ({ ...lb, y: yOf(lb.p) }))
     .sort((a, b) => a.y - b.y);
 
   let lastLabelY = -999;
-  labels.forEach(lb => {
-    const drawY = Math.max(lb.y + 3, lastLabelY + 14);
+  sortedLabels.forEach(lb => {
+    const drawY = Math.max(lb.y + 3, lastLabelY + 12);
     lastLabelY = drawY - 3;
     ctx.fillStyle = lb.color;
-    ctx.fillText(`${lb.tag} ${Math.round(lb.p)}`, plotW + 4, Math.min(h - 6, drawY));
+    ctx.fillText(`${lb.tag} ${Math.round(lb.p)}`, plotW + 4, Math.min(h - 4, drawY));
   });
 }
 
@@ -581,7 +804,6 @@ async function runCycle() {
   if (sym !== state.symbol) {
     state.symbol = sym;
     state.prevCvdSnap = null;
-    state.prevSwingCvd = null;
     state.perVenuePrev = {};
     state.lastSummarySignature = '';
   }
@@ -606,7 +828,8 @@ async function runCycle() {
       throw new Error('Binance klines unavailable');
     }
 
-    const swingAnchor = detectLatestSwingAnchor(fut15);
+    const swingPrecomp = extractAdaptiveSwingPoints(fut15);
+    const swingAnchor = detectLatestSwingAnchor(fut15, swingPrecomp);
     const anchorTs = fut15[swingAnchor.index] ? parseInt(fut15[swingAnchor.index][0], 10) : null;
 
     const [bybitSnap, okxSnap] = await Promise.all([
@@ -634,10 +857,7 @@ async function runCycle() {
       SWING: { fut: bnSwingFut, spot: bnSwingSpot }
     };
 
-    const m5Snap = {
-      fut: Array.isArray(fut5m) && fut5m.length ? calcBinanceCvdFromKlines(fut5m, 1).delta : 0,
-      spot: Array.isArray(spot5m) && spot5m.length ? calcBinanceCvdFromKlines(spot5m, 1).delta : 0
-    };
+    const m5Snap = analyze5mFlowQuality(fut5m, spot5m);
 
     const venues = [{ code: 'BN', snap: bnSnap }];
     if (bybitSnap) venues.push({ code: 'BB', snap: bybitSnap });
@@ -661,7 +881,6 @@ async function runCycle() {
 
         const prevV = state.perVenuePrev[v.code];
         if (prevV && prevV[k]) {
-          // If swing anchor moved to a newer index, compare only if anchor index matches
           if (k === 'SWING' && prevV.swingIndex !== swingAnchor.index) {
             return;
           }
@@ -717,7 +936,10 @@ async function runCycle() {
 
       let pace = 'Σταθερό';
       let paceCls = '';
-      if (hasDelta) {
+      if (key === '5m' && m5Snap.isAbsorption) {
+        pace = 'Απορρόφηση 5m';
+        paceCls = 'pos';
+      } else if (hasDelta) {
         if (fVal > 0 && dFut > 350000) { pace = 'Επιταχύνει ↑'; paceCls = 'pos'; }
         else if (fVal > 0 && dFut < -350000) { pace = 'Μαλακώνει ↓'; paceCls = 'warn-txt'; }
         else if (fVal < 0 && dFut < -350000) { pace = 'Πιέζει κάτω ↓'; paceCls = 'neg'; }
@@ -739,20 +961,22 @@ async function runCycle() {
     document.getElementById('snapClock').textContent =
       `Snapshot: ${new Date().toLocaleTimeString('el-GR')} · [${activeCodes.join('+')}]`;
 
-    const struct = computeDynamicStructure(fut15, currentPrice, snapNow['1h'].fut);
-    drawChart(fut15, struct);
+    const struct = computeDynamicStructure(fut15, currentPrice, snapNow['1h'].fut, swingPrecomp.cfg.windowBars);
+    const swingMap = analyzeAdaptiveSwingMap(fut15, currentPrice, snapNow, m5Snap, deltaNow, hlData, swingPrecomp);
+    drawChart(fut15, struct, swingMap);
 
     document.getElementById('softPivotVal').textContent = `$${fmtPrice(struct.softPivot)}`;
     document.getElementById('hardPivotVal').textContent = `$${fmtPrice(struct.hardPivot)}`;
     document.getElementById('targetPoolVal').textContent = `$${fmtPrice(struct.supplyBottom)} – $${fmtPrice(struct.supplyTop)}`;
-    document.getElementById('sweepBreakVal').textContent = struct.zoneBehavior;
+    document.getElementById('sweepBreakVal').textContent =
+      `${struct.zoneBehavior} · Φακός ${swingMap.windowBars}×15m (${swingMap.modeLabel})`;
     document.getElementById('zoneStatus').textContent =
-      `Demand: $${fmtPrice(struct.demandBottom)}–$${fmtPrice(struct.demandTop)}`;
+      `W:${swingMap.windowBars} · $${fmtPrice(swingMap.lastLow)} (${swingMap.lowTrend}) ↔ $${fmtPrice(swingMap.lastHigh)} (${swingMap.highTrend})`;
     document.getElementById('zoneLegend').innerHTML = `
-      <span class="pos">■ Demand Zone: $${fmtPrice(struct.demandBottom)} – $${fmtPrice(struct.demandTop)}</span>
-      <span class="warn-txt">┄ Μαλακό Pivot: $${fmtPrice(struct.softPivot)}</span>
-      <span class="neg">━ Σκληρό Pivot: $${fmtPrice(struct.hardPivot)}</span>
-      <span>■ Liquidity Pool: $${fmtPrice(struct.supplyBottom)} – $${fmtPrice(struct.supplyTop)}</span>
+      <span class="pos">■ Demand: $${fmtPrice(struct.demandBottom)} – $${fmtPrice(struct.demandTop)}</span>
+      <span class="warn-txt">┄ S-Pivot: $${fmtPrice(struct.softPivot)}</span>
+      <span class="neg">━ H-Pivot: $${fmtPrice(struct.hardPivot)}</span>
+      <span style="color:#38bdf8">┄ Swing (${swingMap.windowBars}): $${fmtPrice(swingMap.lastLow)} – $${fmtPrice(swingMap.lastHigh)}</span>
     `;
 
     const totalVol1h = bnFut1h.totalVol + (bybitSnap?.vol1h || 0) + (okxSnap?.vol1h || 0);
@@ -768,70 +992,49 @@ async function runCycle() {
     document.getElementById('capRatioText').textContent =
       `${cap.ratio} : 1 (${cap.bullShare.toFixed(0)}% Υπέρ / ${(100 - cap.bullShare).toFixed(0)}% Κατά) · ${cap.activeTfLabel}`;
 
-    const diag = computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, currentPrice);
+    const diag = computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, swingMap, currentPrice);
     const f1h = snapNow['1h'].fut;
     const s1h = snapNow['1h'].spot;
     const dF1h = deltaNow['1h'].fut ?? 0;
-    const fSw = snapNow['SWING'].fut;
-    const sSw = snapNow['SWING'].spot;
 
-    let regime = 'NEUTRAL';
+    let regime = swingMap.mapSignal;
     let cardClass = 'summary-card';
-    let headline = '';
-    let detail = '';
-    let syncLabel = '';
+    let headline = `${swingMap.mapHeadline} (${diag.totalScore})`;
+    let detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
+    let syncLabel = `${swingMap.lowTrend} $${fmtPrice(swingMap.lastLow)} ↔ ${swingMap.highTrend} $${fmtPrice(swingMap.lastHigh)} [W:${swingMap.windowBars}]`;
 
-    if (currentPrice < struct.hardPivot && f1h < 0) {
+    if (currentPrice < struct.hardPivot && f1h < 0 && swingMap.mapSignal !== 'DROP_EXHAUSTION_ENTRY') {
       regime = 'HARD_PIVOT_BREAK';
       cardClass = 'summary-card bear';
       headline = `ΣΚΛΗΡΟ PIVOT (${diag.totalScore}): Διάσπαση κάτω από $${fmtPrice(struct.hardPivot)} με πωλητική ροή`;
-      detail = `Η δομή γύρισε καθοδικά (${fmtUsd(f1h)} στο 1h, πηγές ${activeCodes.join('+')}). ${diag.reasonText}.`;
-      syncLabel = `Πίεση πωλητών [${activeCodes.join('+')}]`;
-    } else if (fSw > 0 && sSw <= 0 && f1h <= 0) {
-      regime = 'SWING_REBOUND_LEVERAGE';
+      detail = `Η δομή γύρισε καθοδικά (${fmtUsd(f1h)} στο 1h). ${swingMap.mapAdvice} ${diag.reasonText}.`;
+    } else if (swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY') {
+      cardClass = 'summary-card bull';
+    } else if (swingMap.mapSignal === 'BULL_BREAK_READY' && f1h > 0 && s1h > 0) {
+      cardClass = 'summary-card bull';
+    } else if (swingMap.mapSignal === 'BEAR_BREAK_READY') {
+      cardClass = 'summary-card bear';
+    } else if (swingMap.mapSignal === 'RALLY_EXHAUSTION_WAIT') {
       cardClass = 'summary-card warn';
-      headline = `Ανάκαμψη κόντρα / μόχλευση (${diag.totalScore}): Θετικό Swing CVD (${fmtUsd(fSw)}) χωρίς Spot`;
-      detail = `Το κύμα από το τοπικό ${swingAnchor.type} ($${fmtPrice(swingAnchor.price)}) έχει θετική ροή στα Futures (${fmtUsd(fSw)}), αλλά το Spot δεν στηρίζει (${fmtUsd(sSw)}) και η ευρύτερη εικόνα μένει επιφυλακτική. ${diag.reasonText}.`;
-      syncLabel = `Κύμα Perps ↑ / Spot ↓`;
     } else if (f1h > 0 && s1h > 0 && dF1h >= 0) {
       regime = 'ALIGNED_BULL';
       cardClass = 'summary-card bull';
       headline = `Θετική εισροή (${diag.totalScore}): Futures & Spot προς Pool $${fmtPrice(struct.supplyBottom)}`;
-      detail = `Συμφωνία αγοραστών (${fmtUsd(f1h)} Perps / ${fmtUsd(s1h)} Spot στο 1h σε ${activeCodes.join('+')}). ${diag.reasonText}.`;
-      syncLabel = `Συμφωνία Spot + Futures ↑`;
+      detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
     } else if (f1h > 0 && s1h <= 0) {
       regime = 'PERP_SPOT_DIVERGENCE';
       cardClass = 'summary-card warn';
       headline = `Ασυμφωνία Futures CVD με Spot (${diag.totalScore}) — άνοδος σε μόχλευση`;
-      detail = `Τα Futures δείχνουν θετικό Delta (${fmtUsd(f1h)}), αλλά το Spot δεν ακολουθεί (${fmtUsd(s1h)}). ${diag.reasonText}.`;
-      syncLabel = `Ασυμφωνία: Perps ↑ / Spot ↓`;
-    } else if (f1h > 0 && dF1h < -500000) {
-      regime = 'MOMENTUM_COOLING';
-      cardClass = 'summary-card warn';
-      headline = `Μαλακώνει η θετική εισροή (${diag.totalScore}) — χάνει φόρα (S-Pivot $${fmtPrice(struct.softPivot)})`;
-      detail = `Το 1h CVD παραμένει θετικό (${fmtUsd(f1h)}) αλλά επιβράδυνε κατά ${fmtUsd(dF1h)}. ${diag.reasonText}.`;
-      syncLabel = `Εξασθένιση ορμής`;
-    } else if (currentPrice <= struct.demandTop && (dF1h > 0 || fSw > 0)) {
-      regime = 'DEMAND_ABSORPTION';
-      cardClass = 'summary-card bull';
-      headline = `Απορρόφηση στη ζώνη Demand (${diag.totalScore}) — $${fmtPrice(struct.demandBottom)}–$${fmtPrice(struct.demandTop)}`;
-      detail = `Η τιμή δοκιμάζει στήριξη με ροή κύματος ${fmtUsd(fSw)} (Perp) / ${fmtUsd(sSw)} (Spot). ${diag.reasonText}.`;
-      syncLabel = `Απορρόφηση σε στήριξη`;
-    } else {
-      regime = 'RANGE_WAIT';
-      cardClass = 'summary-card';
-      headline = `Πλάγια χώνεψη (${diag.totalScore}) ανάμεσα σε Demand ($${fmtPrice(struct.demandTop)}) και Pool ($${fmtPrice(struct.supplyBottom)})`;
-      detail = `Χωρίς καθαρό ξέσπασμα εισροών (${fmtUsd(f1h)} 1h Perp · πηγές ${activeCodes.join('+')}). ${diag.reasonText}.`;
-      syncLabel = `Ουδέτερη / Πλάγια ροή`;
+      detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
     }
 
     document.getElementById('pillFlow').textContent =
-      `5m: ${fmtUsd(m5Snap.fut)} | 1h: ${fmtUsd(f1h)} | 4h: ${fmtUsd(snapNow['4h'].fut)}`;
+      `5m: ${fmtUsd(m5Snap.fut)} (${m5Snap.qualityTag}) | 1h: ${fmtUsd(f1h)} | 4h: ${fmtUsd(snapNow['4h'].fut)}`;
     document.getElementById('pillSync').textContent = syncLabel;
     document.getElementById('pillPivot').textContent =
       `S-Pivot $${fmtPrice(struct.softPivot)} · H-Pivot $${fmtPrice(struct.hardPivot)}`;
 
-    const signature = `${regime}|${swingAnchor.type}|${Math.round(diag.totalScore / 10)}`;
+    const signature = `${regime}|${swingMap.windowBars}|${m5Snap.qualityTag}|${Math.round(swingMap.lastLow)}|${Math.round(swingMap.lastHigh)}|${Math.round(diag.totalScore / 10)}`;
     if (signature !== state.lastSummarySignature) {
       state.lastSummarySignature = signature;
       const card = document.getElementById('summaryCard');
@@ -851,8 +1054,10 @@ async function runCycle() {
         : 0;
       const nearPivot =
         Math.abs(currentPrice - struct.softPivot) / currentPrice < 0.0035 ||
-        Math.abs(currentPrice - struct.hardPivot) / currentPrice < 0.004;
-      const flowBurst = Math.abs(dF1h) > 2000000 || Math.abs(m5Snap.fut) > 1500000 || priceMovePct > 0.18;
+        Math.abs(currentPrice - struct.hardPivot) / currentPrice < 0.004 ||
+        Math.abs(currentPrice - swingMap.lastHigh) / currentPrice < 0.0025 ||
+        Math.abs(currentPrice - swingMap.lastLow) / currentPrice < 0.0025;
+      const flowBurst = Math.abs(dF1h) > 2000000 || Math.abs(m5Snap.fut * m5Snap.weightMult) > 1500000 || priceMovePct > 0.18;
 
       scheduleNext((nearPivot || flowBurst) ? 5000 : 45000);
     } else {
@@ -868,10 +1073,20 @@ async function runCycle() {
 document.getElementById('symbolSelect').addEventListener('change', () => runCycle());
 window.addEventListener('resize', () => {
   if (state.klines15m.length && state.prevCvdSnap) {
+    const pre = extractAdaptiveSwingPoints(state.klines15m);
     const s = computeDynamicStructure(
-      state.klines15m, state.lastPrice, state.prevCvdSnap['1h'].fut
+      state.klines15m, state.lastPrice, state.prevCvdSnap['1h'].fut, pre.cfg.windowBars
     );
-    drawChart(state.klines15m, s);
+    const sm = analyzeAdaptiveSwingMap(
+      state.klines15m,
+      state.lastPrice,
+      state.prevCvdSnap,
+      state.prevCvdSnap['5m'] || { fut: 0, spot: 0, weightMult: 1, qualityTag: 'Κανονικό', isAbsorption: false },
+      { '15m': { fut: 0, spot: 0 } },
+      null,
+      pre
+    );
+    drawChart(state.klines15m, s, sm);
   }
 });
 
