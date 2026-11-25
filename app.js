@@ -9,12 +9,12 @@ const state = {
   prevPrice: null,
   klines15m: [],
   prevCvdSnap: null,
-  perVenuePrev: {}, // { BN: snap, BB: snap, OKX: snap }
-  cvdHistory: [],   // Rolling samples: [{ ts, price, m5Fut, m5Spot, f15, s15, f1h, s1h, f4h, s4h, fSw, sSw, f15PerMin, swingKey }]
+  perVenuePrev: {}, // { BN: snap, BB: snap, OKX: snap, CB: snap }
+  cvdHistory: [],   // Rolling samples: [{ ts, price, m5Fut, m5Spot, f15, s15, f1h, s1h, f4h, s4h, fSw, sSw, takerBuyPct, sfState, f15PerMin, swingKey }]
   prevSwingLeg: null, // Last completed swing leg before current anchor
   activeSwingMeta: null, // { key, type, price, startTs }
   shadowState: {
-    activeSweep: null, // { side: 'LOW'|'HIGH', level, extremePrice, startedAt, barsOrCycles }
+    activeSweep: null, // { side: 'LOW'|'HIGH', level, extremePrice, startedAt, cycles }
     lastReclaimTs: 0,
     lastShadowSignalKey: '',
     lastShadowSignalTs: 0
@@ -173,8 +173,103 @@ function scheduleNext(ms) {
   state.timerId = setTimeout(runCycle, ms);
 }
 
+// --- Spot vs. Futures Alignment, Combined CVD & Taker Buy % ---
+function computeSpotFuturesAlignment(snapNow, m5Snap, venueFlowStats, klines15m) {
+  const f15 = snapNow['15m'].fut;
+  const s15 = snapNow['15m'].spot;
+  const f1h = snapNow['1h'].fut;
+  const s1h = snapNow['1h'].spot;
+  const f4h = snapNow['4h'].fut;
+  const s4h = snapNow['4h'].spot;
+  const fSw = snapNow['SWING'].fut;
+  const sSw = snapNow['SWING'].spot;
+
+  const combined15m = f15 + s15;
+  const combined1h = f1h + s1h;
+  const combined4h = f4h + s4h;
+  const combinedSwing = fSw + sSw;
+
+  // Taker Buy % from 1h/15m volume buy/sell totals across venues
+  let buyQuoteSum = 0;
+  let totalQuoteSum = 0;
+  (venueFlowStats || []).forEach(v => {
+    if (v && v.buy1h !== undefined && v.vol1h > 0) {
+      buyQuoteSum += v.buy1h;
+      totalQuoteSum += v.vol1h;
+    }
+  });
+  const takerBuyPct = totalQuoteSum > 0
+    ? Math.max(0, Math.min(100, (buyQuoteSum / totalQuoteSum) * 100))
+    : 50.0;
+
+  // Detect upper wick / rejection on latest 15m candle to avoid chasing wicks
+  const lastBar = Array.isArray(klines15m) && klines15m.length ? klines15m[klines15m.length - 1] : null;
+  let upperWickRejection = false;
+  if (lastBar) {
+    const o = parseFloat(lastBar[1]) || 0;
+    const h = parseFloat(lastBar[2]) || 0;
+    const l = parseFloat(lastBar[3]) || 0;
+    const c = parseFloat(lastBar[4]) || 0;
+    const range = Math.max(h - l, o * 0.0005);
+    const upperWick = h - Math.max(o, c);
+    upperWickRejection = (upperWick / range) >= 0.45 && c < h * 0.9985;
+  }
+
+  const cbSpot1h = venueFlowStats?.find(v => v.code === 'CB')?.spot1h ?? null;
+  const cbSpot15m = venueFlowStats?.find(v => v.code === 'CB')?.spot15m ?? null;
+
+  const futUp = (f1h > 250000) || (f15 > 200000 && m5Snap.fut > 150000);
+  const futDown = (f1h < -250000) || (f15 < -200000 && m5Snap.fut < -150000);
+  const spotUp = (s1h > 150000) || (s15 > 100000 && m5Snap.spot > 80000);
+  const spotDown = (s1h < -150000) || (s15 < -100000 && m5Snap.spot < -80000);
+
+  let code = 'MIXED';
+  let label = 'Μεικτή Ροή';
+  let shortDesc = 'Χωρίς καθαρή συμφωνία Spot & Futures';
+  let isValidBullFlow = false;
+  let isLeverageTrap = false;
+
+  if (futDown && spotDown) {
+    code = 'BOTH_SELLING';
+    label = 'Both Selling';
+    shortDesc = 'Και Futures και Spot πουλάνε — καθαρή προσφορά';
+    isLeverageTrap = false;
+  } else if (futUp && spotUp && takerBuyPct >= 49.5) {
+    code = 'BOTH_BUYING';
+    label = 'Both Buying';
+    shortDesc = 'Συμφωνία Futures & Spot προς τα πάνω με στήριξη αγοράς';
+    isValidBullFlow = true;
+  } else if (futDown && spotUp) {
+    code = 'SPOT_ABSORPTION';
+    label = 'Spot Absorption';
+    shortDesc = 'Πίεση στα Futures αλλά το Spot απορροφά';
+    isLeverageTrap = false;
+  } else if (futUp && (!spotUp || spotDown || takerBuyPct < 49.5)) {
+    code = 'PERP_DIVERGENCE';
+    label = 'Perp Squeeze / Divergence';
+    shortDesc = 'Άνοδος σε μόχλευση χωρίς καθαρή στήριξη Spot';
+    isLeverageTrap = true;
+  }
+
+  return {
+    code,
+    label,
+    shortDesc,
+    takerBuyPct,
+    combined15m,
+    combined1h,
+    combined4h,
+    combinedSwing,
+    upperWickRejection,
+    cbSpot15m,
+    cbSpot1h,
+    isValidBullFlow,
+    isLeverageTrap
+  };
+}
+
 // --- Rolling CVD Velocity, Acceleration & Consistency Calculator ---
-function recordCvdSample(nowTs, currentPrice, m5Snap, snapNow, swingKey, f15PerMin = 0) {
+function recordCvdSample(nowTs, currentPrice, m5Snap, snapNow, swingKey, f15PerMin = 0, takerBuyPct = 50, sfState = 'MIXED') {
   state.cvdHistory.push({
     ts: nowTs,
     price: currentPrice,
@@ -188,6 +283,8 @@ function recordCvdSample(nowTs, currentPrice, m5Snap, snapNow, swingKey, f15PerM
     s4h: snapNow['4h'].spot,
     fSw: snapNow['SWING'].fut,
     sSw: snapNow['SWING'].spot,
+    takerBuyPct,
+    sfState,
     f15PerMin,
     swingKey
   });
@@ -232,7 +329,6 @@ function computeRollingFlowStats(currentSwingKey) {
   const f1hPerMin = (latest.f1h - base.f1h) / elapsedMin;
   const s1hPerMin = (latest.s1h - base.s1h) / elapsedMin;
 
-  // Measure rate change (acceleration / deceleration of flow)
   const prevSample = hist[hist.length - 2];
   const prevDtMin = Math.max(0.08, (latest.ts - prevSample.ts) / 60000);
   const instRateNow = (latest.f15 - prevSample.f15) / prevDtMin;
@@ -299,7 +395,7 @@ function computeRollingFlowStats(currentSwingKey) {
 }
 
 // --- Algo Shadow Detector: Sweep, Reclaim, Trap & Velocity Reversal ---
-function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swingMap, m5Snap, rollingStats, hlData) {
+function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swingMap, m5Snap, rollingStats, hlData, sfAlign = null) {
   const lastBar = klines15m[klines15m.length - 1] || [];
   const barLow = parseFloat(lastBar[3]) || currentPrice;
   const barHigh = parseFloat(lastBar[2]) || currentPrice;
@@ -307,7 +403,7 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
 
   const lowerSweepRef = Math.min(swingMap.lastLow, struct.hardPivot);
   const upperSweepRef = Math.max(swingMap.lastHigh, struct.supplyBottom);
-  const sweepTol = currentPrice * 0.0005; // tiny pierce buffer
+  const sweepTol = currentPrice * 0.0005;
 
   const sh = state.shadowState;
   let shadowTag = 'SHADOW: SCANNING';
@@ -323,7 +419,6 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
   };
 
   if (!sh.activeSweep) {
-    // Check downward sweep (wick/pierce below lowerSweepRef)
     if (barLow < lowerSweepRef - sweepTol || currentPrice < lowerSweepRef) {
       const ext = Math.min(barLow, currentPrice);
       sh.activeSweep = {
@@ -339,9 +434,7 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
         'SHADOW · LIQUIDITY SWEEP ΚΑΤΩ',
         `Χτύπησε κάτω από $${fmtPrice(lowerSweepRef)} (χαμηλό $${fmtPrice(ext)}). Έλεγχος αν θα βγάλει ουρά/reclaim ή θα κλείσει κάτω χωρίς στήριξη.`
       );
-    }
-    // Check upward sweep (pierce above upperSweepRef)
-    else if (barHigh > upperSweepRef + sweepTol || currentPrice > upperSweepRef) {
+    } else if (barHigh > upperSweepRef + sweepTol || currentPrice > upperSweepRef) {
       const ext = Math.max(barHigh, currentPrice);
       sh.activeSweep = {
         side: 'HIGH',
@@ -366,24 +459,22 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
         sw.extremePrice = Math.min(barLow, currentPrice);
       }
 
-      const reclaimedLevel = Math.max(sw.level, struct.softPivot * 0.999);
       const flowTurningBull = m5Snap.fut > 0 || m5Snap.isAbsorption || rollingStats.deceleratingDown || rollingStats.f15PerMin > 100000;
+      const spotSupportsReclaim = !sfAlign || sfAlign.code === 'SPOT_ABSORPTION' || sfAlign.code === 'BOTH_BUYING' || sfAlign.takerBuyPct >= 49.5;
 
-      // Reclaimed back above swept level
       if (currentPrice >= sw.level && barClose >= sw.level) {
         sh.activeSweep = null;
         sh.lastReclaimTs = nowTs;
-        shadowTag = flowTurningBull ? 'SWEEP & RECLAIM (LONG WATCH)' : 'RECLAIMED (CHECK FLOW)';
-        scoreAdj = flowTurningBull ? 18 : 8;
+        const confirmedReclaim = flowTurningBull && spotSupportsReclaim;
+        shadowTag = confirmedReclaim ? 'SWEEP & RECLAIM (LONG WATCH)' : 'RECLAIMED (CHECK FLOW)';
+        scoreAdj = confirmedReclaim ? 18 : 6;
         emitShadowSignal(
           `RECLAIM_LOW_${Math.round(sw.level / 50)}`,
           'SHADOW · SWEEP & RECLAIM CONFIRMED',
-          `Ανάκτηση πάνω από $${fmtPrice(sw.level)} μετά από sweep στα $${fmtPrice(sw.extremePrice)} (${sw.cycles} κύκλοι) · ${rollingStats.label}.`,
+          `Ανάκτηση πάνω από $${fmtPrice(sw.level)} μετά από sweep στα $${fmtPrice(sw.extremePrice)} (${sw.cycles} κύκλοι) · ${sfAlign?.label || ''} · ${rollingStats.label}.`,
           60000
         );
-      }
-      // Still below swept level for too long with heavy selling -> potential real breakdown
-      else if (sw.cycles >= 6 && rollingStats.f15PerMin < -250000 && !flowTurningBull) {
+      } else if (sw.cycles >= 6 && rollingStats.f15PerMin < -250000 && !flowTurningBull) {
         shadowTag = 'UNRECLAIMED BREAKDOWN RISK';
         scoreAdj = -12;
       } else {
@@ -394,7 +485,7 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
         sw.extremePrice = Math.max(barHigh, currentPrice);
       }
 
-      const flowTurningBear = m5Snap.fut < 0 || rollingStats.f15PerMin < -150000;
+      const flowTurningBear = m5Snap.fut < 0 || rollingStats.f15PerMin < -150000 || Boolean(sfAlign?.upperWickRejection);
       if (currentPrice < sw.level && barClose < sw.level) {
         sh.activeSweep = null;
         sh.lastReclaimTs = nowTs;
@@ -403,7 +494,7 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
         emitShadowSignal(
           `REJECT_HIGH_${Math.round(sw.level / 50)}`,
           'SHADOW · SWEEP & REJECTION',
-          `Επιστροφή κάτω από $${fmtPrice(sw.level)} μετά από sweep στα $${fmtPrice(sw.extremePrice)} · ${rollingStats.label}.`,
+          `Επιστροφή κάτω από $${fmtPrice(sw.level)} μετά από sweep στα $${fmtPrice(sw.extremePrice)} · ${sfAlign?.label || ''} · ${rollingStats.label}.`,
           60000
         );
       } else {
@@ -412,8 +503,7 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
     }
   }
 
-  // Recent post-reclaim window tag
-  if (!sh.activeSweep && sh.lastReclaimTs && (nowTs - sh.lastReclaimTs) < 180000) {
+  if (!sh.activeSweep && sh.lastReclaimTs && (nowTs - sh.lastReclaimTs) < 180000 && !sfAlign?.isLeverageTrap) {
     shadowTag = 'POST-RECLAIM MOMENTUM';
     scoreAdj += 8;
   }
@@ -428,20 +518,22 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
 
 // Binance exact taker buy/sell quote delta over last `bars` or from `startIndex`
 function calcBinanceCvdFromKlines(klines, bars, startIndex = null) {
-  if (!Array.isArray(klines) || !klines.length) return { delta: 0, totalVol: 0, count: 0 };
+  if (!Array.isArray(klines) || !klines.length) return { delta: 0, totalVol: 0, buyVol: 0, count: 0 };
   const slice = startIndex !== null
     ? klines.slice(Math.max(0, startIndex))
     : klines.slice(-bars);
   let delta = 0;
   let totalVol = 0;
+  let buyVol = 0;
   for (const k of slice) {
     const quoteVol = parseFloat(k[7]) || 0;
     const takerBuyQuote = parseFloat(k[10]) || 0;
     const takerSellQuote = quoteVol - takerBuyQuote;
     delta += (takerBuyQuote - takerSellQuote);
     totalVol += quoteVol;
+    buyVol += takerBuyQuote;
   }
-  return { delta, totalVol, count: slice.length };
+  return { delta, totalVol, buyVol, count: slice.length };
 }
 
 // Analyze 5m candle weight (volume vs 1h average) & absorption (heavy flow with minimal price move)
@@ -507,6 +599,7 @@ function calcBybitFlowFromKlines(list, bars, startIndex = null) {
     : list.slice(-bars);
   let delta = 0;
   let totalVol = 0;
+  let buyVol = 0;
   for (const k of slice) {
     const o = parseFloat(k[1]);
     const h = parseFloat(k[2]);
@@ -515,10 +608,12 @@ function calcBybitFlowFromKlines(list, bars, startIndex = null) {
     const turnover = parseFloat(k[6]) || 0;
     const range = Math.max(h - l, o * 0.0002);
     const bodyRatio = Math.max(-1, Math.min(1, (c - o) / range));
-    delta += turnover * bodyRatio * 0.35;
+    const d = turnover * bodyRatio * 0.35;
+    delta += d;
     totalVol += turnover;
+    buyVol += turnover * (0.5 + bodyRatio * 0.175);
   }
-  return { delta, totalVol, count: slice.length };
+  return { delta, totalVol, buyVol, count: slice.length };
 }
 
 function calcOkxFlowFromKlines(list, bars, startIndex = null) {
@@ -528,6 +623,7 @@ function calcOkxFlowFromKlines(list, bars, startIndex = null) {
     : list.slice(-bars);
   let delta = 0;
   let totalVol = 0;
+  let buyVol = 0;
   for (const k of slice) {
     const o = parseFloat(k[1]);
     const h = parseFloat(k[2]);
@@ -536,10 +632,87 @@ function calcOkxFlowFromKlines(list, bars, startIndex = null) {
     const quoteVol = parseFloat(k[7]) || 0;
     const range = Math.max(h - l, o * 0.0002);
     const bodyRatio = Math.max(-1, Math.min(1, (c - o) / range));
-    delta += quoteVol * bodyRatio * 0.35;
+    const d = quoteVol * bodyRatio * 0.35;
+    delta += d;
     totalVol += quoteVol;
+    buyVol += quoteVol * (0.5 + bodyRatio * 0.175);
   }
-  return { delta, totalVol, count: slice.length };
+  return { delta, totalVol, buyVol, count: slice.length };
+}
+
+// Coinbase Spot klines: [time, low, high, open, close, baseVolume]
+function calcCoinbaseSpotFlowFromKlines(list, bars, startIndex = null) {
+  if (!Array.isArray(list) || !list.length) return null;
+  const slice = startIndex !== null
+    ? list.slice(Math.max(0, startIndex))
+    : list.slice(-bars);
+  let delta = 0;
+  let totalVol = 0;
+  let buyVol = 0;
+  for (const k of slice) {
+    const l = parseFloat(k[1]);
+    const h = parseFloat(k[2]);
+    const o = parseFloat(k[3]);
+    const c = parseFloat(k[4]);
+    const baseVol = parseFloat(k[5]) || 0;
+    const avgPx = (o + c) / 2 || c || o || 1;
+    const quoteVol = baseVol * avgPx;
+    const range = Math.max(h - l, o * 0.0002);
+    const bodyRatio = Math.max(-1, Math.min(1, (c - o) / range));
+    const d = quoteVol * bodyRatio * 0.40;
+    delta += d;
+    totalVol += quoteVol;
+    buyVol += quoteVol * (0.5 + bodyRatio * 0.20);
+  }
+  return { delta, totalVol, buyVol, count: slice.length };
+}
+
+async function fetchCoinbaseSpotData(sym, anchorTs = null) {
+  try {
+    const base = sym.replace('USDT', '');
+    const candidates = [`${base}-USD`, `${base}-USDT`];
+    let candles = null;
+
+    for (const productId of candidates) {
+      const res = await fetch(`https://api.exchange.coinbase.com/products/${productId}/candles?granularity=900`);
+      if (!res.ok) continue;
+      const json = await res.json();
+      if (Array.isArray(json) && json.length >= 20) {
+        candles = [...json].reverse().slice(-120);
+        break;
+      }
+    }
+
+    if (!candles) return null;
+
+    // Coinbase candle timestamp is in seconds (k[0] * 1000)
+    const startIdx = findStartIndexByTs(candles, anchorTs, k => parseInt(k[0], 10) * 1000);
+    const s15 = calcCoinbaseSpotFlowFromKlines(candles, 1)?.delta ?? 0;
+    const s1hFlow = calcCoinbaseSpotFlowFromKlines(candles, 4);
+    const s4hFlow = calcCoinbaseSpotFlowFromKlines(candles, 16);
+    const s1dFlow = calcCoinbaseSpotFlowFromKlines(candles, 96);
+    const sSwFlow = startIdx !== null ? calcCoinbaseSpotFlowFromKlines(candles, 0, startIdx) : null;
+
+    return {
+      snap: {
+        '15m': { fut: 0, spot: s15 },
+        '1h':  { fut: 0, spot: s1hFlow?.delta ?? 0 },
+        '4h':  { fut: 0, spot: s4hFlow?.delta ?? 0 },
+        '1D':  { fut: 0, spot: s1dFlow?.delta ?? 0 },
+        SWING: { fut: 0, spot: sSwFlow?.delta ?? 0 }
+      },
+      stats: {
+        code: 'CB',
+        spot15m: s15,
+        spot1h: s1hFlow?.delta ?? 0,
+        vol1h: s1hFlow?.totalVol ?? 0,
+        buy1h: s1hFlow?.buyVol ?? 0,
+        vol4h: s4hFlow?.totalVol ?? 0
+      }
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 function getAdaptiveWindowConfig(klines15m) {
@@ -662,7 +835,7 @@ function detectLatestSwingAnchor(klines15m, precomputed = null) {
   return { ...chosen, barsAgo: Math.max(1, n - 1 - chosen.index) };
 }
 
-function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, deltaNow, hlData, rollingStats, precomputed = null) {
+function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, deltaNow, hlData, rollingStats, precomputed = null, sfAlign = null) {
   const { sigHighs, sigLows, cfg } = precomputed || extractAdaptiveSwingPoints(klines15m);
   const slice = klines15m.slice(-cfg.windowBars);
   const fallbackHigh = Math.max(...slice.map(k => parseFloat(k[2])));
@@ -697,6 +870,9 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
   const sellingEasing = (f5Weighted > 0 || m5Snap.isAbsorption || dF15 > 250000 || rollingEasingBear || (fSw > 0 && lowTrend === 'HL'));
   const buyingEasing = (f5Weighted < 0 || dF15 < -250000 || rollingEasingBull || (fSw < 0 && highTrend === 'LH'));
 
+  const validBullBreak = currentPrice > lastHigh.price && fSw > 0 && f5Weighted >= -200000 &&
+    !sfAlign?.isLeverageTrap && !sfAlign?.upperWickRejection && (sfAlign?.takerBuyPct ?? 50) >= 49.0;
+
   let mapSignal = 'MID_CORRIDOR';
   let mapHeadline = '';
   let mapAdvice = '';
@@ -707,11 +883,16 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
     mapScoreBias = hlShortSqueezeBias ? 34 : 28;
     mapHeadline = `Επιβράδυνση πτώσης κοντά στο ${lowTrend} ($${fmtPrice(lastLow.price)}) — έλεγχος εισόδου`;
     mapAdvice = `Η ευρύτερη εικόνα είναι επιφυλακτική/πτωτική, αλλά η τοπική ροή μαλακώνει (5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}], SWG: ${fmtUsd(fSw)}, ${rollingStats.label}).${hlShortSqueezeBias ? ' Στο HL πιέζονται shorts.' : ''} Ενδείκνυται έλεγχος εισόδου αντί για κυνηγητό σορτ.`;
-  } else if (currentPrice > lastHigh.price && fSw > 0 && f5Weighted >= -200000) {
+  } else if (validBullBreak) {
     mapSignal = 'BULL_BREAK_READY';
-    mapScoreBias = (hlShortSqueezeBias ? 38 : 32) + (rollingStats.spotLeading ? 6 : 0);
+    mapScoreBias = (hlShortSqueezeBias ? 38 : 32) + (rollingStats.spotLeading || sfAlign?.code === 'BOTH_BUYING' ? 6 : 0);
     mapHeadline = `Διάσπαση πάνω από ${highTrend} ($${fmtPrice(lastHigh.price)}) με καύσιμο CVD`;
-    mapAdvice = `Σπάσιμο τοπικής κορυφής με ροή κύματος (${fmtUsd(fSw)} Perp / ${fmtUsd(sSw)} Spot) · ${rollingStats.label}.`;
+    mapAdvice = `Σπάσιμο τοπικής κορυφής με ροή κύματος (${fmtUsd(fSw)} Perp / ${fmtUsd(sSw)} Spot · ${sfAlign?.label || ''}) · ${rollingStats.label}.`;
+  } else if (currentPrice > lastHigh.price && fSw > 0 && (sfAlign?.isLeverageTrap || sfAlign?.upperWickRejection)) {
+    mapSignal = 'RALLY_EXHAUSTION_WAIT';
+    mapScoreBias = -18;
+    mapHeadline = `Πέρασμα πάνω από ${highTrend} ($${fmtPrice(lastHigh.price)}) με κίνδυνο παγίδας/wick`;
+    mapAdvice = `Η κίνηση πάνω από το τοπικό υψηλό συνοδεύεται από ${sfAlign?.upperWickRejection ? 'άνω ουρά απόρριψης' : sfAlign?.shortDesc || 'ασυμφωνία Spot/Perp'} (Buy ${sfAlign?.takerBuyPct?.toFixed(1) ?? '--'}%). Αναμονή για καθαρή επιβεβαίωση.`;
   } else if (currentPrice < lastLow.price && fSw < 0 && !sellingEasing) {
     mapSignal = 'BEAR_BREAK_READY';
     mapScoreBias = hlLongHeavyBias ? -38 : -32;
@@ -751,7 +932,7 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
 
 // Autonomous background critic: flags blind spots, contradictions, rolling exhaustion, or traps
 function evaluateAutonomousAdvisor(ctx) {
-  const { currentPrice, struct, swingMap, diag, snapNow, m5Snap, deltaNow, hlData, rollingStats, prevSwingLeg, shadowInfo } = ctx;
+  const { currentPrice, struct, swingMap, diag, snapNow, m5Snap, deltaNow, hlData, rollingStats, prevSwingLeg, shadowInfo, sfAlign } = ctx;
   const fSw = snapNow['SWING'].fut;
   const sSw = snapNow['SWING'].spot;
   const f1h = snapNow['1h'].fut;
@@ -763,7 +944,15 @@ function evaluateAutonomousAdvisor(ctx) {
   let title = '';
   let msg = '';
 
-  if (diag.totalScore >= 15 && s1h < -250000 && f4h < -15000000) {
+  if (sfAlign?.code === 'BOTH_SELLING' && currentPrice >= state.prevPrice) {
+    code = 'BOTH_SELLING_RALLY';
+    title = 'ΣΥΜΒΟΥΛΟΣ · BOTH SELLING ΣΤΗΝ ΑΝΟΔΟ';
+    msg = `Και τα Futures (${fmtUsd(snapNow['15m'].fut)}) και το Spot (${fmtUsd(snapNow['15m'].spot)}, Buy ${sfAlign.takerBuyPct.toFixed(1)}%) έχουν καθαρή πώληση. Προσοχή σε κίνηση ξετυλίγματος/squeeze χωρίς αγοραστική στήριξη.`;
+  } else if (sfAlign?.isLeverageTrap) {
+    code = 'PERP_SPOT_TRAP';
+    title = 'ΣΥΜΒΟΥΛΟΣ · ΑΝΟΔΟΣ ΜΕ ΜΟΧΛΕΥΣΗ / ΧΩΡΙΣ SPOT';
+    msg = `${sfAlign.shortDesc} (1h Perp ${fmtUsd(f1h)} / Spot ${fmtUsd(s1h)} · Buy ${sfAlign.takerBuyPct.toFixed(1)}%). Απόφυγε βιαστικό κυνηγητό ψηλά.`;
+  } else if (diag.totalScore >= 15 && s1h < -250000 && f4h < -15000000) {
     code = 'SPOT_VS_4H_TRAP';
     title = 'ΣΥΜΒΟΥΛΟΣ · ΑΝΤΙΦΑΣΗ SPOT & 4H';
     msg = `Το score δείχνει θετικό (${diag.totalScore}), αλλά το 1h Spot είναι αρνητικό (${fmtUsd(s1h)}) και το 4h βαραίνει (${fmtUsd(f4h)}). Μην περάσεις εύκολα το ριμπάουντ για αλλαγή κύριας τάσης.`;
@@ -841,15 +1030,24 @@ async function fetchBybitData(sym, anchorTs = null) {
     const spotStart = findStartIndexByTs(spotList, anchorTs, k => parseInt(k[0], 10));
     const swingFut = linStart !== null ? calcBybitFlowFromKlines(linList, 0, linStart)?.delta ?? 0 : 0;
     const swingSpot = spotStart !== null ? calcBybitFlowFromKlines(spotList, 0, spotStart)?.delta ?? 0 : 0;
+    const f1h = calcBybitFlowFromKlines(linList, 4);
+    const s1h = calcBybitFlowFromKlines(spotList, 4);
 
     return {
-      '15m': { fut: calcBybitFlowFromKlines(linList, 1).delta, spot: calcBybitFlowFromKlines(spotList, 1).delta },
-      '1h':  { fut: calcBybitFlowFromKlines(linList, 4).delta, spot: calcBybitFlowFromKlines(spotList, 4).delta },
-      '4h':  { fut: calcBybitFlowFromKlines(linList, 16).delta, spot: calcBybitFlowFromKlines(spotList, 16).delta },
-      '1D':  { fut: calcBybitFlowFromKlines(linList, 96).delta, spot: calcBybitFlowFromKlines(spotList, 96).delta },
-      SWING: { fut: swingFut, spot: swingSpot },
-      vol1h: calcBybitFlowFromKlines(linList, 4).totalVol,
-      vol4h: calcBybitFlowFromKlines(linList, 16).totalVol
+      snap: {
+        '15m': { fut: calcBybitFlowFromKlines(linList, 1).delta, spot: calcBybitFlowFromKlines(spotList, 1).delta },
+        '1h':  { fut: f1h.delta, spot: s1h.delta },
+        '4h':  { fut: calcBybitFlowFromKlines(linList, 16).delta, spot: calcBybitFlowFromKlines(spotList, 16).delta },
+        '1D':  { fut: calcBybitFlowFromKlines(linList, 96).delta, spot: calcBybitFlowFromKlines(spotList, 96).delta },
+        SWING: { fut: swingFut, spot: swingSpot }
+      },
+      stats: {
+        code: 'BB',
+        vol1h: f1h.totalVol + s1h.totalVol,
+        buy1h: f1h.buyVol + s1h.buyVol,
+        futVol1h: f1h.totalVol,
+        futVol4h: calcBybitFlowFromKlines(linList, 16).totalVol
+      }
     };
   } catch (e) {
     return null;
@@ -874,15 +1072,24 @@ async function fetchOkxData(sym, anchorTs = null) {
     const spotStart = findStartIndexByTs(spotList, anchorTs, k => parseInt(k[0], 10));
     const swingFut = swapStart !== null ? calcOkxFlowFromKlines(swapList, 0, swapStart)?.delta ?? 0 : 0;
     const swingSpot = spotStart !== null ? calcOkxFlowFromKlines(spotList, 0, spotStart)?.delta ?? 0 : 0;
+    const f1h = calcOkxFlowFromKlines(swapList, 4);
+    const s1h = calcOkxFlowFromKlines(spotList, 4);
 
     return {
-      '15m': { fut: calcOkxFlowFromKlines(swapList, 1).delta, spot: calcOkxFlowFromKlines(spotList, 1).delta },
-      '1h':  { fut: calcOkxFlowFromKlines(swapList, 4).delta, spot: calcOkxFlowFromKlines(spotList, 4).delta },
-      '4h':  { fut: calcOkxFlowFromKlines(swapList, 16).delta, spot: calcOkxFlowFromKlines(spotList, 16).delta },
-      '1D':  { fut: calcOkxFlowFromKlines(swapList, 96).delta, spot: calcOkxFlowFromKlines(spotList, 96).delta },
-      SWING: { fut: swingFut, spot: swingSpot },
-      vol1h: calcOkxFlowFromKlines(swapList, 4).totalVol,
-      vol4h: calcOkxFlowFromKlines(swapList, 16).totalVol
+      snap: {
+        '15m': { fut: calcOkxFlowFromKlines(swapList, 1).delta, spot: calcOkxFlowFromKlines(spotList, 1).delta },
+        '1h':  { fut: f1h.delta, spot: s1h.delta },
+        '4h':  { fut: calcOkxFlowFromKlines(swapList, 16).delta, spot: calcOkxFlowFromKlines(spotList, 16).delta },
+        '1D':  { fut: calcOkxFlowFromKlines(swapList, 96).delta, spot: calcOkxFlowFromKlines(spotList, 96).delta },
+        SWING: { fut: swingFut, spot: swingSpot }
+      },
+      stats: {
+        code: 'OKX',
+        vol1h: f1h.totalVol + s1h.totalVol,
+        buy1h: f1h.buyVol + s1h.buyVol,
+        futVol1h: f1h.totalVol,
+        futVol4h: calcOkxFlowFromKlines(swapList, 16).totalVol
+      }
     };
   } catch (e) {
     return null;
@@ -973,7 +1180,7 @@ function computeDynamicStructure(klines, currentPrice, cvd1hDelta, windowBars = 
   };
 }
 
-function computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, swingMap, rollingStats, currentPrice, shadowAdj = 0) {
+function computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, swingMap, rollingStats, currentPrice, shadowAdj = 0, sfAlign = null) {
   const f15 = snapNow['15m'].fut;
   const s15 = snapNow['15m'].spot;
   const f1h = snapNow['1h'].fut;
@@ -1000,15 +1207,16 @@ function computeWeightedDiagnosis(struct, snapNow, m5Snap, swingAnchor, swingMap
   const rollingBonus = rollingStats.hasHistory
     ? Math.max(-12, Math.min(12, (rollingStats.f15PerMin / 400000) * (rollingStats.consistencyPct / 100) * 10))
     : 0;
+  const sfAdj = sfAlign?.isLeverageTrap ? -14 : (sfAlign?.code === 'BOTH_BUYING' ? 8 : (sfAlign?.code === 'BOTH_SELLING' ? -8 : 0));
   const moveNorm = Math.max(6000000, Math.abs(fSw) * 0.9 + Math.abs(w5Fut) * 4);
   const flowComponent = ((w5Fut * 1.5 + w5Spot * 2.2 + fSw * 0.65 + sSw * 1.2 + f15 * 0.45 + s15 * 0.8) / moveNorm) * 70;
-  const mapScore = Math.max(-100, Math.min(100, flowComponent + swingMap.mapScoreBias + rollingBonus + shadowAdj));
+  const mapScore = Math.max(-100, Math.min(100, flowComponent + swingMap.mapScoreBias + rollingBonus + shadowAdj + sfAdj));
 
   const totalScore = Math.round(structScore * 0.35 + macroScore * 0.30 + mapScore * 0.35);
 
   const reasons = [
     `Φακός ${swingMap.windowBars}×15m (${swingMap.modeLabel}): ${swingMap.lowTrend} $${fmtPrice(swingMap.lastLow)} ↔ ${swingMap.highTrend} $${fmtPrice(swingMap.lastHigh)} (${Math.round(swingMap.posInCorridor * 100)}%)`,
-    `Από ${swingAnchor.type === 'LOW' ? 'χαμηλό' : 'υψηλό'} $${fmtPrice(swingAnchor.price)}: Perp ${fmtUsd(fSw)} / Spot ${fmtUsd(sSw)} · 5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}] · ${rollingStats.label}`,
+    `Από ${swingAnchor.type === 'LOW' ? 'χαμηλό' : 'υψηλό'} $${fmtPrice(swingAnchor.price)}: Perp ${fmtUsd(fSw)} / Spot ${fmtUsd(sSw)} · ${sfAlign?.label || ''} (Buy ${sfAlign?.takerBuyPct?.toFixed(1) ?? '--'}%) · 5m: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}] · ${rollingStats.label}`,
     `Βάρη: Δομή 35% (${structScore > 0 ? '+' : ''}${structScore}) · 1h/4h 30% (${macroScore > 0 ? '+' : ''}${Math.round(macroScore)}) · Φακός 35% (${mapScore > 0 ? '+' : ''}${Math.round(mapScore)})`
   ];
 
@@ -1284,9 +1492,10 @@ async function runCycle() {
     const anchorTs = fut15[swingAnchor.index] ? parseInt(fut15[swingAnchor.index][0], 10) : null;
     const swingKey = `${swingAnchor.type}_${Math.round(swingAnchor.price)}_${anchorTs || 0}`;
 
-    const [bybitSnap, okxSnap] = await Promise.all([
+    const [bybitRes, okxRes, cbRes] = await Promise.all([
       fetchBybitData(sym, anchorTs),
-      fetchOkxData(sym, anchorTs)
+      fetchOkxData(sym, anchorTs),
+      fetchCoinbaseSpotData(sym, anchorTs)
     ]);
 
     const currentPrice = parseFloat(fut15[fut15.length - 1][4]);
@@ -1296,24 +1505,43 @@ async function runCycle() {
 
     document.getElementById('livePrice').textContent = `$${fmtPrice(currentPrice)}`;
 
+    const bnFut15 = calcBinanceCvdFromKlines(fut15, 1);
+    const bnSpot15 = calcBinanceCvdFromKlines(spot15, 1);
     const bnFut1h = calcBinanceCvdFromKlines(fut15, 4);
+    const bnSpot1h = calcBinanceCvdFromKlines(spot15, 4);
     const bnFut4h = calcBinanceCvdFromKlines(fut1h, 4);
+    const bnSpot4h = calcBinanceCvdFromKlines(spot1h, 4);
+    const bnFut1d = calcBinanceCvdFromKlines(fut1h, 24);
+    const bnSpot1d = calcBinanceCvdFromKlines(spot1h, 24);
     const bnSwingFut = calcBinanceCvdFromKlines(fut15, 0, swingAnchor.index).delta;
     const bnSwingSpot = calcBinanceCvdFromKlines(spot15, 0, swingAnchor.index).delta;
 
     const bnSnap = {
-      '15m': { fut: calcBinanceCvdFromKlines(fut15, 1).delta, spot: calcBinanceCvdFromKlines(spot15, 1).delta },
-      '1h':  { fut: bnFut1h.delta, spot: calcBinanceCvdFromKlines(spot15, 4).delta },
-      '4h':  { fut: bnFut4h.delta, spot: calcBinanceCvdFromKlines(spot1h, 4).delta },
-      '1D':  { fut: calcBinanceCvdFromKlines(fut1h, 24).delta, spot: calcBinanceCvdFromKlines(spot1h, 24).delta },
+      '15m': { fut: bnFut15.delta, spot: bnSpot15.delta },
+      '1h':  { fut: bnFut1h.delta, spot: bnSpot1h.delta },
+      '4h':  { fut: bnFut4h.delta, spot: bnSpot4h.delta },
+      '1D':  { fut: bnFut1d.delta, spot: bnSpot1d.delta },
       SWING: { fut: bnSwingFut, spot: bnSwingSpot }
     };
 
     const m5Snap = analyze5mFlowQuality(fut5m, spot5m);
 
-    const venues = [{ code: 'BN', snap: bnSnap }];
-    if (bybitSnap) venues.push({ code: 'BB', snap: bybitSnap });
-    if (okxSnap) venues.push({ code: 'OKX', snap: okxSnap });
+    const venues = [{
+      code: 'BN',
+      snap: bnSnap,
+      stats: {
+        code: 'BN',
+        spot15m: bnSpot15.delta,
+        spot1h: bnSpot1h.delta,
+        vol1h: bnFut1h.totalVol + bnSpot1h.totalVol,
+        buy1h: bnFut1h.buyVol + bnSpot1h.buyVol,
+        futVol1h: bnFut1h.totalVol,
+        futVol4h: bnFut4h.totalVol
+      }
+    }];
+    if (bybitRes) venues.push({ code: 'BB', snap: bybitRes.snap, stats: bybitRes.stats });
+    if (okxRes) venues.push({ code: 'OKX', snap: okxRes.snap, stats: okxRes.stats });
+    if (cbRes) venues.push({ code: 'CB', snap: cbRes.snap, stats: cbRes.stats });
 
     const tfKeys = ['15m', '1h', '4h', '1D', 'SWING'];
     const snapNow = {};
@@ -1349,6 +1577,9 @@ async function runCycle() {
       };
     });
 
+    const venueStatsList = venues.map(v => v.stats).filter(Boolean);
+    const sfAlign = computeSpotFuturesAlignment(snapNow, m5Snap, venueStatsList, fut15);
+
     if (state.activeSwingMeta && state.activeSwingMeta.key !== swingKey && state.prevCvdSnap?.['SWING']) {
       state.prevSwingLeg = {
         key: state.activeSwingMeta.key,
@@ -1366,12 +1597,11 @@ async function runCycle() {
       startTs: anchorTs
     };
 
-    // Estimate current velocity before appending so rolling stats capture acceleration cleanly
     const lastHist = state.cvdHistory[state.cvdHistory.length - 1];
     const estMin = lastHist ? Math.max(0.15, (nowTs - lastHist.ts) / 60000) : 0.75;
     const estF15Rate = lastHist ? (snapNow['15m'].fut - lastHist.f15) / estMin : 0;
 
-    recordCvdSample(nowTs, currentPrice, m5Snap, snapNow, swingKey, estF15Rate);
+    recordCvdSample(nowTs, currentPrice, m5Snap, snapNow, swingKey, estF15Rate, sfAlign.takerBuyPct, sfAlign.code);
     const rollingStats = computeRollingFlowStats(swingKey);
 
     venues.forEach(v => {
@@ -1452,14 +1682,14 @@ async function runCycle() {
     }).join('');
 
     document.getElementById('snapClock').textContent =
-      `Snapshot: ${new Date().toLocaleTimeString('el-GR')} · [${activeCodes.join('+')}]${resumeNote}`;
+      `Snapshot: ${new Date().toLocaleTimeString('el-GR')} · [${activeCodes.join('+')}] · Buy ${sfAlign.takerBuyPct.toFixed(1)}% · ${sfAlign.label}${resumeNote}`;
 
     const struct = computeDynamicStructure(fut15, currentPrice, snapNow['1h'].fut, swingPrecomp.cfg.windowBars);
     const swingMap = analyzeAdaptiveSwingMap(
-      fut15, currentPrice, snapNow, m5Snap, deltaNow, hlData, rollingStats, swingPrecomp
+      fut15, currentPrice, snapNow, m5Snap, deltaNow, hlData, rollingStats, swingPrecomp, sfAlign
     );
     const shadowInfo = evaluateAlgoShadowMechanics(
-      nowTs, fut15, currentPrice, struct, swingMap, m5Snap, rollingStats, hlData
+      nowTs, fut15, currentPrice, struct, swingMap, m5Snap, rollingStats, hlData, sfAlign
     );
 
     drawChart(fut15, struct, swingMap);
@@ -1481,8 +1711,8 @@ async function runCycle() {
       <span style="color:#38bdf8">┄ Swing (${swingMap.windowBars}): $${fmtPrice(swingMap.lastLow)} – $${fmtPrice(swingMap.lastHigh)}</span>
     `;
 
-    const totalVol1h = bnFut1h.totalVol + (bybitSnap?.vol1h || 0) + (okxSnap?.vol1h || 0);
-    const totalVol4h = bnFut4h.totalVol + (bybitSnap?.vol4h || 0) + (okxSnap?.vol4h || 0);
+    const totalVol1h = venueStatsList.reduce((acc, s) => acc + (s.futVol1h || 0), 0);
+    const totalVol4h = venueStatsList.reduce((acc, s) => acc + (s.futVol4h || 0), 0);
 
     const cap = computeAdaptiveCapitalRatio(
       snapNow, state.prevCvdSnap, totalVol1h, totalVol4h, hlData, activeCodes
@@ -1495,7 +1725,7 @@ async function runCycle() {
       `${cap.ratio} : 1 (${cap.bullShare.toFixed(0)}% Υπέρ / ${(100 - cap.bullShare).toFixed(0)}% Κατά) · ${cap.activeTfLabel}`;
 
     const diag = computeWeightedDiagnosis(
-      struct, snapNow, m5Snap, swingAnchor, swingMap, rollingStats, currentPrice, shadowInfo.scoreAdj
+      struct, snapNow, m5Snap, swingAnchor, swingMap, rollingStats, currentPrice, shadowInfo.scoreAdj, sfAlign
     );
     const f1h = snapNow['1h'].fut;
     const s1h = snapNow['1h'].spot;
@@ -1505,9 +1735,9 @@ async function runCycle() {
     let cardClass = 'summary-card';
     let headline = `${swingMap.mapHeadline} (${diag.totalScore})`;
     let detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
-    let syncLabel = `${shadowInfo.shadowTag} · ${swingMap.lowTrend} $${fmtPrice(swingMap.lastLow)} ↔ ${swingMap.highTrend} $${fmtPrice(swingMap.lastHigh)}`;
+    let syncLabel = `${sfAlign.label} · Buy ${sfAlign.takerBuyPct.toFixed(1)}% · ${shadowInfo.shadowTag}`;
 
-    if (shadowInfo.shadowTag.includes('SWEEP & RECLAIM')) {
+    if (shadowInfo.shadowTag.includes('SWEEP & RECLAIM') && !sfAlign.isLeverageTrap) {
       regime = 'SHADOW_SWEEP_RECLAIM';
       cardClass = 'summary-card bull';
       headline = `SHADOW RECLAIM (${diag.totalScore}): Ανάκτηση επιπέδου μετά από sweep`;
@@ -1519,13 +1749,17 @@ async function runCycle() {
       detail = `Η δομή γύρισε καθοδικά (${fmtUsd(f1h)} στο 1h). ${swingMap.mapAdvice} ${diag.reasonText}.`;
     } else if (swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY') {
       cardClass = 'summary-card bull';
-    } else if (swingMap.mapSignal === 'BULL_BREAK_READY' && f1h > 0 && s1h > 0) {
+    } else if (swingMap.mapSignal === 'BULL_BREAK_READY' && sfAlign.isValidBullFlow && !sfAlign.upperWickRejection) {
       cardClass = 'summary-card bull';
     } else if (swingMap.mapSignal === 'BEAR_BREAK_READY') {
       cardClass = 'summary-card bear';
-    } else if (swingMap.mapSignal === 'RALLY_EXHAUSTION_WAIT') {
+    } else if (swingMap.mapSignal === 'RALLY_EXHAUSTION_WAIT' || sfAlign.isLeverageTrap) {
       cardClass = 'summary-card warn';
-    } else if (f1h > 0 && s1h > 0 && dF1h >= 0) {
+      if (sfAlign.isLeverageTrap && swingMap.mapSignal !== 'RALLY_EXHAUSTION_WAIT') {
+        regime = 'PERP_SPOT_DIVERGENCE';
+        headline = `Ασυμφωνία Futures CVD με Spot (${diag.totalScore}) — άνοδος σε μόχλευση`;
+      }
+    } else if (sfAlign.isValidBullFlow && dF1h >= 0 && !sfAlign.upperWickRejection) {
       regime = 'ALIGNED_BULL';
       cardClass = 'summary-card bull';
       headline = `Θετική εισροή (${diag.totalScore}): Futures & Spot προς Pool $${fmtPrice(struct.supplyBottom)}`;
@@ -1548,7 +1782,8 @@ async function runCycle() {
       hlData,
       rollingStats,
       prevSwingLeg: state.prevSwingLeg,
-      shadowInfo
+      shadowInfo,
+      sfAlign
     });
 
     if (advisorNote) {
@@ -1562,7 +1797,7 @@ async function runCycle() {
     document.getElementById('pillPivot').textContent =
       `S-Pivot $${fmtPrice(struct.softPivot)} · H-Pivot $${fmtPrice(struct.hardPivot)}`;
 
-    const signature = `${regime}|${shadowInfo.shadowTag}|${swingMap.windowBars}|${m5Snap.qualityTag}|${Math.round(swingMap.lastLow)}|${Math.round(swingMap.lastHigh)}|${Math.round(diag.totalScore / 10)}|${advisorNote?.code || ''}`;
+    const signature = `${regime}|${sfAlign.code}|${shadowInfo.shadowTag}|${swingMap.windowBars}|${m5Snap.qualityTag}|${Math.round(swingMap.lastLow)}|${Math.round(swingMap.lastHigh)}|${Math.round(diag.totalScore / 10)}|${advisorNote?.code || ''}`;
     if (signature !== state.lastSummarySignature) {
       state.lastSummarySignature = signature;
       const card = document.getElementById('summaryCard');
@@ -1570,7 +1805,7 @@ async function runCycle() {
       document.getElementById('summaryHeadline').textContent = headline;
       document.getElementById('summaryDetail').textContent = detail;
       document.getElementById('summaryUpdated').textContent =
-        `Ενημερώθηκε: ${new Date().toLocaleTimeString('el-GR')} [${activeCodes.join('+')}]`;
+        `Ενημερώθηκε: ${new Date().toLocaleTimeString('el-GR')} [${activeCodes.join('+')}] · Buy ${sfAlign.takerBuyPct.toFixed(1)}%`;
       pushEvent(regime.replaceAll('_', ' '), headline);
     }
 
@@ -1622,7 +1857,8 @@ window.addEventListener('resize', () => {
       { '15m': { fut: 0, spot: 0 } },
       null,
       { hasHistory: false, label: 'Αναμονή' },
-      pre
+      pre,
+      null
     );
     drawChart(state.klines15m, s, sm);
   }
