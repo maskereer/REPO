@@ -9,6 +9,8 @@ const state = {
   prevCvdSnap: null,
   perVenuePrev: {}, // { BN: snap, BB: snap, OKX: snap }
   lastSummarySignature: '',
+  lastAdvisorSignature: '',
+  lastAdvisorTs: 0,
   events: []
 };
 
@@ -167,7 +169,6 @@ function calcOkxFlowFromKlines(list, bars, startIndex = null) {
   return { delta, totalVol, count: slice.length };
 }
 
-// Compute adaptive lookback window (20..72 x 15m bars) based on recent range & choppiness
 function getAdaptiveWindowConfig(klines15m) {
   const n = klines15m.length;
   const currentPrice = parseFloat(klines15m[n - 1]?.[4] || 1);
@@ -370,6 +371,70 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
     windowBars: cfg.windowBars,
     modeLabel: cfg.modeLabel
   };
+}
+
+// Autonomous background critic: flags blind spots, contradictions, or traps when conditions warrant
+function evaluateAutonomousAdvisor(ctx) {
+  const { currentPrice, struct, swingMap, diag, snapNow, m5Snap, deltaNow, hlData } = ctx;
+  const fSw = snapNow['SWING'].fut;
+  const sSw = snapNow['SWING'].spot;
+  const f1h = snapNow['1h'].fut;
+  const s1h = snapNow['1h'].spot;
+  const f4h = snapNow['4h'].fut;
+  const dF1h = deltaNow['1h']?.fut ?? 0;
+
+  let code = null;
+  let title = '';
+  let msg = '';
+
+  // 1) Bullish headline/score vs negative Spot & heavy 4h overhang (leverage/counter-trend trap)
+  if (diag.totalScore >= 15 && s1h < -250000 && f4h < -15000000) {
+    code = 'SPOT_VS_4H_TRAP';
+    title = 'ΣΥΜΒΟΥΛΟΣ · ΑΝΤΙΦΑΣΗ SPOT & 4H';
+    msg = `Το score δείχνει θετικό (${diag.totalScore}), αλλά το 1h Spot είναι αρνητικό (${fmtUsd(s1h)}) και το 4h βαραίνει (${fmtUsd(f4h)}). Μην περάσεις εύκολα το ριμπάουντ για αλλαγή κύριας τάσης.`;
+  }
+  // 2) Counter-trend bounce near swing high / supply without spot backing
+  else if (swingMap.posInCorridor >= 0.75 && fSw > 0 && sSw <= 0 && (f4h < 0 || f1h < 0)) {
+    code = 'HIGH_FADE_RISK';
+    title = 'ΣΥΜΒΟΥΛΟΣ · ΠΙΕΣΗ ΣΤΟ ΑΝΩ ΑΚΡΟ';
+    msg = `Η τιμή φτάνει στο ${Math.round(swingMap.posInCorridor * 100)}% του διαδρόμου προς ${swingMap.highTrend} ($${fmtPrice(swingMap.lastHigh)}) με θετικό Perp swing (${fmtUsd(fSw)}) αλλά χωρίς στήριξη Spot (${fmtUsd(sSw)}). Πρόσεξε το ρίσκο απόρριψης/LH.`;
+  }
+  // 3) Absorption detected on 5m near a key boundary or structure level
+  else if (m5Snap.isAbsorption && (swingMap.posInCorridor <= 0.35 || swingMap.posInCorridor >= 0.65 || currentPrice <= struct.demandTop)) {
+    code = 'ABSORPTION_WATCH';
+    title = 'ΣΥΜΒΟΥΛΟΣ · ΑΠΟΡΡΟΦΗΣΗ ΣΕ ΚΡΙΣΙΜΟ ΣΗΜΕΙΟ';
+    msg = `Καταγράφηκε απορρόφηση στο 5m (${fmtUsd(m5Snap.fut)}) κοντά σε κρίσιμη ζώνη. Μεγάλη ροή χωρίς αναλογική κίνηση τιμής συχνά προηγείται στροφής ή απότομου ξεσπάσματος — περίμενε κλείσιμο επιβεβαίωσης.`;
+  }
+  // 4) Drop exhaustion setup while hard pivot / 4h still looms
+  else if (swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY' && currentPrice < struct.softPivot) {
+    code = 'DROP_EASING_CHECK';
+    title = 'ΣΥΜΒΟΥΛΟΣ · ΦΡΕΝΑΡΙΣΜΑ ΠΤΩΣΗΣ';
+    msg = `Οι πωλητές μαλακώνουν κοντά στο ${swingMap.lowTrend} ($${fmtPrice(swingMap.lastLow)}), όμως η τιμή είναι ακόμα κάτω από το S-Pivot ($${fmtPrice(struct.softPivot)}) και το H-Pivot στα $${fmtPrice(struct.hardPivot)}. Μικρό μέγεθος / έλεγχος επιβεβαίωσης αντί για βιαστικό all-in.`;
+  }
+  // 5) Extreme Hyperliquid funding skew aligned with momentum shift
+  else if (hlData && Math.abs(hlData.annualizedPct) >= 25 && Math.abs(dF1h) >= 1200000) {
+    const dirSide = hlData.fundingHourly < 0 ? 'SHORTS' : 'LONGS';
+    code = `HL_SKEW_${dirSide}`;
+    title = `ΣΥΜΒΟΥΛΟΣ · ΠΙΕΣΗ ${dirSide} ΣΤΟ HL`;
+    msg = `Στο Hyperliquid το funding είναι έντονο (${hlData.annualizedPct.toFixed(1)}% ετησιοποιημένο · OI ${fmtUsd(hlData.oiUsd)}) ενώ η 1h ροή κινείται απότομα (${fmtUsd(dF1h)}). Υψηλή πιθανότητα νευρικής εκκαθάρισης/squeeze.`;
+  }
+
+  if (!code) return null;
+
+  const nowMs = Date.now();
+  const signature = `${code}|${Math.round(currentPrice / 50)}|${Math.round(diag.totalScore / 10)}`;
+  const elapsedMs = nowMs - state.lastAdvisorTs;
+
+  if (signature === state.lastAdvisorSignature && elapsedMs < 90000) {
+    return null;
+  }
+  if (elapsedMs < 25000) {
+    return null;
+  }
+
+  state.lastAdvisorSignature = signature;
+  state.lastAdvisorTs = nowMs;
+  return { code, title, msg };
 }
 
 function findStartIndexByTs(list, anchorTs, tsExtractor) {
@@ -806,6 +871,7 @@ async function runCycle() {
     state.prevCvdSnap = null;
     state.perVenuePrev = {};
     state.lastSummarySignature = '';
+    state.lastAdvisorSignature = '';
   }
   const baseCoin = sym.replace('USDT', '');
 
@@ -1028,13 +1094,22 @@ async function runCycle() {
       detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
     }
 
+    const advisorNote = evaluateAutonomousAdvisor({
+      currentPrice, struct, swingMap, diag, snapNow, m5Snap, deltaNow, hlData
+    });
+
+    if (advisorNote) {
+      detail = `${detail} | [Σύμβουλος: ${advisorNote.msg}]`;
+      pushEvent(advisorNote.title, advisorNote.msg);
+    }
+
     document.getElementById('pillFlow').textContent =
       `5m: ${fmtUsd(m5Snap.fut)} (${m5Snap.qualityTag}) | 1h: ${fmtUsd(f1h)} | 4h: ${fmtUsd(snapNow['4h'].fut)}`;
     document.getElementById('pillSync').textContent = syncLabel;
     document.getElementById('pillPivot').textContent =
       `S-Pivot $${fmtPrice(struct.softPivot)} · H-Pivot $${fmtPrice(struct.hardPivot)}`;
 
-    const signature = `${regime}|${swingMap.windowBars}|${m5Snap.qualityTag}|${Math.round(swingMap.lastLow)}|${Math.round(swingMap.lastHigh)}|${Math.round(diag.totalScore / 10)}`;
+    const signature = `${regime}|${swingMap.windowBars}|${m5Snap.qualityTag}|${Math.round(swingMap.lastLow)}|${Math.round(swingMap.lastHigh)}|${Math.round(diag.totalScore / 10)}|${advisorNote?.code || ''}`;
     if (signature !== state.lastSummarySignature) {
       state.lastSummarySignature = signature;
       const card = document.getElementById('summaryCard');
