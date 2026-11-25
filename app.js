@@ -882,28 +882,31 @@ function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlDa
   const dF15 = prevSnap ? (f15 - prevSnap['15m'].fut) : 0;
   const dF1h = prevSnap ? (f1h - prevSnap['1h'].fut) : 0;
 
-  const shortMag = Math.abs(f15) + Math.abs(f1h) + Math.abs(s1h) * 2 + Math.abs(dF1h);
-  const macroMag = Math.abs(f4h) + Math.abs(f1d) * 0.4 + Math.abs(s4h) * 2 + Math.abs(s1d) * 0.5;
+  const shortMag = Math.abs(f15) + Math.abs(f1h) + Math.abs(s1h) * 1.5 + Math.abs(dF1h);
+  const macroMag = Math.abs(f4h) + Math.abs(f1d) * 0.35 + Math.abs(s4h) * 1.5 + Math.abs(s1d) * 0.4;
 
   const shortImpulseStrong = shortMag > macroMag * 0.42 || Math.abs(dF15) > 1200000 || fut4hVol < fut1hVol * 2.2;
-  const wShort = shortImpulseStrong ? 1.65 : 0.65;
-  const wMacro = shortImpulseStrong ? 0.55 : 1.35;
+  const wShort = shortImpulseStrong ? 1.5 : 0.75;
+  const wMacro = shortImpulseStrong ? 0.65 : 1.25;
   const activeTfLabel = shortImpulseStrong ? '15m/1h Ροή' : '4h/1D Δομή';
 
-  let hlBullWeight = 0;
-  let hlBearWeight = 0;
+  let bullTilt = 1.0;
+  let bearTilt = 1.0;
   let hlPain = 'Ουδέτερο funding (χωρίς ακραίο πόνο)';
 
   if (hlData) {
     const ann = hlData.annualizedPct;
     document.getElementById('hlFundingBadge').textContent =
       `HL: ${(hlData.fundingHourly * 100).toFixed(4)}%/h (${ann.toFixed(1)}%)`;
+
     if (hlData.fundingHourly < -0.00005) {
-      hlPain = `Πιέζονται SHORTS (πληρώνουν longs · OI ${fmtUsd(hlData.oiUsd)})`;
-      hlBullWeight = hlData.oiUsd * 0.08;
+      hlPain = `Πιέζονται SHORTS (funding αρνητικό · HL OI ${fmtUsd(hlData.oiUsd)})`;
+      bullTilt = 1.15;
+      bearTilt = 0.90;
     } else if (hlData.fundingHourly > 0.00015) {
-      hlPain = `Πιέζονται LONGS (ακριβό funding · OI ${fmtUsd(hlData.oiUsd)})`;
-      hlBearWeight = hlData.oiUsd * 0.08;
+      hlPain = `Πιέζονται LONGS (funding θετικό · HL OI ${fmtUsd(hlData.oiUsd)})`;
+      bearTilt = 1.15;
+      bullTilt = 0.90;
     } else {
       hlPain = `Ισορροπημένο funding · HL OI: ${fmtUsd(hlData.oiUsd)} · [${activeVenues.join('+')}]`;
     }
@@ -912,17 +915,17 @@ function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlDa
     hlPain = `Ενεργές πηγές: ${activeVenues.join(' + ')} (HL εκτός)`;
   }
 
-  const rawBull =
-    (Math.max(0, f15) + Math.max(0, f1h) + Math.max(0, s1h) * 2 + Math.max(0, dF15)) * wShort +
-    (Math.max(0, f4h) + Math.max(0, f1d) * 0.35 + Math.max(0, s4h) * 2) * wMacro +
-    hlBullWeight;
+  const rawBull = (
+    (Math.max(0, f15) + Math.max(0, f1h) + Math.max(0, s1h) * 1.5 + Math.max(0, dF15)) * wShort +
+    (Math.max(0, f4h) + Math.max(0, f1d) * 0.35 + Math.max(0, s4h) * 1.5) * wMacro
+  ) * bullTilt;
 
-  const rawBear =
-    (Math.max(0, -f15) + Math.max(0, -f1h) + Math.max(0, -s1h) * 2 + Math.max(0, -dF15)) * wShort +
-    (Math.max(0, -f4h) + Math.max(0, -f1d) * 0.35 + Math.max(0, -s4h) * 2) * wMacro +
-    hlBearWeight;
+  const rawBear = (
+    (Math.max(0, -f15) + Math.max(0, -f1h) + Math.max(0, -s1h) * 1.5 + Math.max(0, -dF15)) * wShort +
+    (Math.max(0, -f4h) + Math.max(0, -f1d) * 0.35 + Math.max(0, -s4h) * 1.5) * wMacro
+  ) * bearTilt;
 
-  const floorBase = Math.max(250000, (fut1hVol + fut4hVol) * 0.002);
+  const floorBase = Math.max(250000, (fut1hVol + fut4hVol) * 0.0015);
   const bullCap = Math.max(rawBull, floorBase * 0.25);
   const bearCap = Math.max(rawBear, floorBase * 0.25);
 
@@ -938,6 +941,7 @@ function computeAdaptiveCapitalRatio(snapNow, prevSnap, fut1hVol, fut4hVol, hlDa
     activeTfLabel
   };
 }
+
 
 async function fetchHyperliquidPain(coin) {
   try {
