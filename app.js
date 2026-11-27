@@ -466,9 +466,7 @@ function computeSpotFuturesAlignment(snapNow, m5Snap, venueFlowStats, klines15m,
   };
 }
 
-// --- 4. Adaptive Macro Price-Leg & Authenticity Estimator ---
-// Tracks major price swings in %/$, shifts anchor once a major support/resistance is left behind,
-// and estimates whether the current leg is real/consolidating or hollow/vulnerable to loss.
+// --- 4. Adaptive Macro Price-Leg & Authenticity Estimator (Fixed Direction & Loss Risk) ---
 function evaluateMacroPriceLeg(klines15m, currentPrice, snapNow, rollingStats, sfAlign, liqInfo, sessionCtx) {
   const sc = sessionCtx?.flowScale ?? 1;
   const n = Array.isArray(klines15m) ? klines15m.length : 0;
@@ -488,10 +486,8 @@ function evaluateMacroPriceLeg(klines15m, currentPrice, snapNow, rollingStats, s
   const loAll = Math.min(...slice.map(k => parseFloat(k[3]) || currentPrice));
   const rangePct = currentPrice > 0 ? (hiAll - loAll) / currentPrice : 0.03;
 
-  // Adaptive threshold for major macro legs (scales with volatility)
-  const majorMovePct = Math.max(0.022, Math.min(0.045, rangePct * 0.42));
+  const majorMovePct = Math.max(0.020, Math.min(0.045, rangePct * 0.40));
 
-  // Detect alternating major highs and lows
   const pivots = [];
   let mode = null; // 'LOW' or 'HIGH'
   let extPrice = parseFloat(slice[0][4]) || currentPrice;
@@ -539,53 +535,58 @@ function evaluateMacroPriceLeg(klines15m, currentPrice, snapNow, rollingStats, s
     }
   }
 
-  // Fallback if no major pivot completed yet: use rolling min/max
   let anchorLow = loAll;
   let anchorHigh = hiAll;
   let prevLegPct = 0;
-  let dir = currentPrice >= (parseFloat(slice[0][4]) || currentPrice) ? 'UP' : 'DOWN';
+  let dir = 'UP';
 
   if (pivots.length >= 2) {
     const lastP = pivots[pivots.length - 1];
     const prevP = pivots[pivots.length - 2];
 
     if (lastP.type === 'LOW') {
-      // A major low/support formed after an earlier high:
-      // If price has cleared above that support and moved meaningfully upward, anchor from this support forward
       anchorLow = lastP.price;
       anchorHigh = Math.max(currentPrice, prevP.type === 'HIGH' ? prevP.price : currentPrice);
       prevLegPct = prevP.type === 'HIGH' ? ((prevP.price - lastP.price) / Math.max(lastP.price, 1)) * 100 : 0;
-      dir = 'UP';
+      // FIX: If price broke meaningfully below the low anchor (< -0.35%), it is a DOWN leg, NOT an UP leg!
+      dir = currentPrice < anchorLow * 0.9965 ? 'DOWN' : 'UP';
     } else {
-      // A major high formed after an earlier low
       anchorHigh = lastP.price;
       anchorLow = Math.min(currentPrice, prevP.type === 'LOW' ? prevP.price : currentPrice);
       prevLegPct = prevP.type === 'LOW' ? ((lastP.price - prevP.price) / Math.max(prevP.price, 1)) * 100 : 0;
-      dir = currentPrice >= anchorLow ? 'UP_PULLBACK' : 'DOWN';
+      dir = currentPrice >= anchorLow * 0.9985 ? 'UP_PULLBACK' : 'DOWN';
     }
   } else if (pivots.length === 1) {
     const p0 = pivots[0];
     if (p0.type === 'LOW') {
       anchorLow = p0.price;
       anchorHigh = Math.max(currentPrice, hiAll);
-      dir = 'UP';
+      dir = currentPrice < anchorLow * 0.9965 ? 'DOWN' : 'UP';
     } else {
       anchorHigh = p0.price;
       anchorLow = Math.min(currentPrice, loAll);
-      dir = 'DOWN';
+      dir = currentPrice < anchorHigh * 0.985 ? 'DOWN' : 'UP_PULLBACK';
     }
+  } else {
+    const startPx = parseFloat(slice[0][4]) || currentPrice;
+    anchorLow = Math.min(startPx, currentPrice, loAll);
+    anchorHigh = Math.max(startPx, currentPrice, hiAll);
+    dir = currentPrice >= startPx ? 'UP' : 'DOWN';
   }
 
-  const legDeltaUsd = dir === 'DOWN' ? (currentPrice - anchorHigh) : (currentPrice - anchorLow);
-  const legDeltaPct = dir === 'DOWN'
-    ? ((currentPrice - anchorHigh) / Math.max(anchorHigh, 1)) * 100
-    : ((currentPrice - anchorLow) / Math.max(anchorLow, 1)) * 100;
+  // FIX: When dir === 'DOWN', measure from anchorLow if price broke below support, else from anchorHigh
+  const brokeSupport = currentPrice < anchorLow * 0.9965;
+  const refPrice = dir === 'DOWN'
+    ? (brokeSupport ? anchorLow : anchorHigh)
+    : anchorLow;
+
+  const legDeltaUsd = currentPrice - refPrice;
+  const legDeltaPct = ((currentPrice - refPrice) / Math.max(refPrice, 1)) * 100;
 
   const span = Math.max(anchorHigh - anchorLow, currentPrice * 0.01);
   const progressInRangePct = Math.max(0, Math.min(100, Math.round(((currentPrice - anchorLow) / span) * 100)));
 
-  // Score move authenticity & consolidation vs hollowness / risk of losing the move
-  let holdPts = 52;
+  let holdPts = 50;
   const f1h = snapNow['1h']?.fut ?? 0;
   const s1h = snapNow['1h']?.spot ?? 0;
   const f4h = snapNow['4h']?.fut ?? 0;
@@ -598,30 +599,34 @@ function evaluateMacroPriceLeg(klines15m, currentPrice, snapNow, rollingStats, s
     if (progressInRangePct >= 80 && rollingStats.f15PerMin < 50000 * sc) holdPts -= 10;
     if (liqInfo?.longCrowded && (liqInfo?.oiDeltaUsd ?? 0) >= 0) holdPts -= 8;
   } else {
-    if (legDeltaPct <= -1.5 && (f1h < 0 || s1h < 0)) holdPts += 10;
-    if (sfAlign?.code === 'BOTH_SELLING') holdPts += 10;
-    if (rollingStats.deceleratingDown || sfAlign?.code === 'SPOT_ABSORPTION') holdPts -= 14;
-    if (f4h > 0 && s1h > 0) holdPts -= 8;
+    // DOWN leg: negative price change means loss of upward move / downward pressure
+    holdPts -= 14;
+    if (legDeltaPct <= -1.5) holdPts -= 10;
+    if (sfAlign?.code === 'BOTH_SELLING') holdPts -= 10;
+    if (rollingStats.deceleratingDown || sfAlign?.code === 'SPOT_ABSORPTION') holdPts += 12;
+    if (f4h > 0 && s1h > 0) holdPts += 6;
   }
 
-  holdPts = Math.max(22, Math.min(82, Math.round(holdPts)));
+  holdPts = Math.max(18, Math.min(82, Math.round(holdPts)));
   const losePts = 100 - holdPts;
 
-  let status = 'ΕΔΡΑΙΩΝΕΤΑΙ';
-  if (holdPts >= 62) {
+  let status = 'ΔΟΚΙΜΗ ΕΔΡΑΙΩΣΗΣ';
+  if (dir === 'DOWN' && losePts >= 58) {
+    status = 'ΚΑΘΟΔΙΚΗ ΠΙΕΣΗ / ΑΠΩΛΕΙΑ ΚΙΝΗΣΗΣ';
+  } else if (holdPts >= 62) {
     status = 'ΠΡΑΓΜΑΤΙΚΗ / ΕΔΡΑΙΩΝΕΤΑΙ';
   } else if (losePts >= 58) {
     status = 'ΚΟΥΦΙΑ ή ΕΥΑΛΩΤΗ (ΚΙΝΔΥΝΟΣ ΑΠΩΛΕΙΑΣ)';
-  } else {
-    status = 'ΔΟΚΙΜΗ ΕΔΡΑΙΩΣΗΣ';
   }
 
-  const baseRefPrice = dir === 'DOWN' ? anchorHigh : anchorLow;
   const signPct = legDeltaPct >= 0 ? '+' : '';
   const prevCompTxt = prevLegPct > 0 ? ` · Προηγ. σκέλος ${prevLegPct.toFixed(1)}%` : '';
+  const baseLabel = dir === 'DOWN'
+    ? (brokeSupport ? 'σπασμένη στήριξη' : 'κορυφή')
+    : 'στήριξη/βάση';
 
-  const shortTag = `Από $${fmtPrice(baseRefPrice)} (${signPct}${legDeltaPct.toFixed(1)}%): ${status} · Κράτημα ${holdPts}% / Απώλεια ${losePts}%`;
-  const detail = `Μακρο-κύμα από στήριξη/βάση $${fmtPrice(baseRefPrice)} (${signPct}${legDeltaPct.toFixed(1)}%, ${fmtUsd(legDeltaUsd)}, εύρος ${progressInRangePct}%${prevCompTxt}) → ${status} (Εδραίωση/Συνέχεια ${holdPts}% vs Κίνδυνος απώλειας κίνησης ${losePts}%).`;
+  const shortTag = `Από $${fmtPrice(refPrice)} (${signPct}${legDeltaPct.toFixed(1)}%): ${status} · Κράτημα ${holdPts}% / Απώλεια ${losePts}%`;
+  const detail = `Μακρο-κύμα από ${baseLabel} $${fmtPrice(refPrice)} (${signPct}${legDeltaPct.toFixed(1)}%, ${fmtUsd(legDeltaUsd)}, εύρος ${progressInRangePct}%${prevCompTxt}) → ${status} (Εδραίωση/Συνέχεια ${holdPts}% vs Κίνδυνος απώλειας κίνησης ${losePts}%).`;
 
   return {
     hasLeg: true,
@@ -877,7 +882,7 @@ function evaluateAlgoShadowMechanics(nowTs, klines15m, currentPrice, struct, swi
     }
   }
 
-  if (!sh.activeSweep && sh.lastReclaimTs && (nowTs - sh.lastReclaimTs) < 180000 && !sfAlign?.isLeverageTrap) {
+  if (!sh.activeSweep && sh.lastReclaimTs && (nowTs - sh.lastReclaimTs) < 180000 && !sfAlign?.isLeverageTrap && currentPrice >= lowerSweepRef) {
     shadowTag = 'POST-RECLAIM MOMENTUM';
     scoreAdj += 8;
   }
@@ -1241,6 +1246,9 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
   const span = Math.max(lastHigh.price - lastLow.price, currentPrice * 0.004);
   const posInCorridor = Math.max(0, Math.min(1, (currentPrice - lastLow.price) / span));
 
+  // FIX: Explicit breakdown detection when price drops well below lastLow without reclaim
+  const isBreakdownBelowLow = currentPrice < lastLow.price * 0.9965;
+
   const fSw = snapNow['SWING'].fut;
   const sSw = snapNow['SWING'].spot;
   const f15 = snapNow['15m'].fut;
@@ -1256,7 +1264,7 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
   const rollingEasingBull = rollingStats.hasHistory && rollingStats.f15PerMin < -120000 * sc && rollingStats.consistencyPct >= 60;
 
   const macroBearish = f4h < 0 || (f1h < 0 && posInCorridor <= 0.5);
-  const sellingEasing = (f5Weighted > 0 || m5Snap.isAbsorption || dF15 > 250000 * sc || rollingEasingBear || (fSw > 0 && lowTrend === 'HL'));
+  const sellingEasing = !isBreakdownBelowLow && (f5Weighted > 0 || m5Snap.isAbsorption || dF15 > 250000 * sc || rollingEasingBear || (fSw > 0 && lowTrend === 'HL'));
   const buyingEasing = (f5Weighted < 0 || dF15 < -250000 * sc || rollingEasingBull || (fSw < 0 && highTrend === 'LH'));
 
   const validBullBreak = currentPrice > lastHigh.price && fSw > 0 && f5Weighted >= -200000 * sc &&
@@ -1267,7 +1275,13 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
   let mapAdvice = '';
   let mapScoreBias = 0;
 
-  if (macroBearish && posInCorridor <= 0.45 && sellingEasing) {
+  // FIX: Never classify a clean/deep breakdown below lastLow as DROP_EXHAUSTION_ENTRY
+  if (isBreakdownBelowLow) {
+    mapSignal = 'BEAR_BREAK_READY';
+    mapScoreBias = longHeavyBias ? -38 : -32;
+    mapHeadline = `Διάσπαση κάτω από ${lowTrend} ($${fmtPrice(lastLow.price)}) — τιμή στα $${fmtPrice(currentPrice)}`;
+    mapAdvice = `Η τιμή έσπασε κάτω από το ${lowTrend} ($${fmtPrice(lastLow.price)}). Μην το περνάς για στήριξη/εξάντληση όσο δεν ανακτά το επίπεδο (${sfAlign?.label || ''}, ${rollingStats.label}) · ${liqInfo?.magnetSummary || ''}.`;
+  } else if (macroBearish && posInCorridor <= 0.45 && sellingEasing) {
     mapSignal = 'DROP_EXHAUSTION_ENTRY';
     mapScoreBias = shortSqueezeBias ? 34 : 28;
     mapHeadline = `Επιβράδυνση πτώσης κοντά στο ${lowTrend} ($${fmtPrice(lastLow.price)}) — έλεγχος εισόδου`;
@@ -1310,6 +1324,7 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
     highTrend,
     lowTrend,
     posInCorridor,
+    isBreakdownBelowLow,
     mapSignal,
     mapHeadline,
     mapAdvice,
@@ -1920,6 +1935,25 @@ async function runCycle() {
     const anchorTs = fut15[swingAnchor.index] ? parseInt(fut15[swingAnchor.index][0], 10) : null;
     const swingKey = `${swingAnchor.type}_${Math.round(swingAnchor.price)}_${anchorTs || 0}`;
 
+    // FIX: Reset stale SWING previous snapshot if the swing anchor changed
+    if (state.activeSwingMeta && state.activeSwingMeta.key !== swingKey) {
+      if (state.prevCvdSnap?.['SWING']) {
+        state.prevSwingLeg = {
+          key: state.activeSwingMeta.key,
+          type: state.activeSwingMeta.type,
+          price: state.activeSwingMeta.price,
+          fut: state.prevCvdSnap['SWING'].fut,
+          spot: state.prevCvdSnap['SWING'].spot,
+          endedAt: nowTs
+        };
+      }
+      Object.keys(state.perVenuePrev).forEach(vCode => {
+        if (state.perVenuePrev[vCode]?.swingKey !== swingKey) {
+          state.perVenuePrev[vCode] = null;
+        }
+      });
+    }
+
     const [bybitRes, okxRes, cbRes, derivFuel] = await Promise.all([
       fetchBybitData(sym, anchorTs),
       fetchOkxData(sym, anchorTs),
@@ -2008,16 +2042,6 @@ async function runCycle() {
     const venueStatsList = venues.map(v => v.stats).filter(Boolean);
     const sfAlign = computeSpotFuturesAlignment(snapNow, m5Snap, venueStatsList, fut15, sessionCtx, liqInfo);
 
-    if (state.activeSwingMeta && state.activeSwingMeta.key !== swingKey && state.prevCvdSnap?.['SWING']) {
-      state.prevSwingLeg = {
-        key: state.activeSwingMeta.key,
-        type: state.activeSwingMeta.type,
-        price: state.activeSwingMeta.price,
-        fut: state.prevCvdSnap['SWING'].fut,
-        spot: state.prevCvdSnap['SWING'].spot,
-        endedAt: nowTs
-      };
-    }
     state.activeSwingMeta = {
       key: swingKey,
       type: swingAnchor.type,
@@ -2170,19 +2194,22 @@ async function runCycle() {
     let detail = `${macroLeg.detail} ${swingMap.mapAdvice} ${diag.reasonText}.`;
     let syncLabel = `${sfAlign.label} · SpotBuy ${sfAlign.spotBuyPct.toFixed(1)}% · ${shadowInfo.shadowTag}`;
 
-    if (shadowInfo.shadowTag.includes('SWEEP & RECLAIM') && !sfAlign.isLeverageTrap) {
+    // FIX: Never paint bull card if price is broken below swingMap.lastLow without reclaim
+    const safelyBullishAllowed = !swingMap.isBreakdownBelowLow;
+
+    if (shadowInfo.shadowTag.includes('SWEEP & RECLAIM') && !sfAlign.isLeverageTrap && safelyBullishAllowed) {
       regime = 'SHADOW_SWEEP_RECLAIM';
       cardClass = 'summary-card bull';
       headline = `SHADOW RECLAIM (${diag.totalScore}): Ανάκτηση επιπέδου μετά από sweep`;
       detail = `${macroLeg.detail} ${shadowInfo.shadowAlert?.body || swingMap.mapAdvice} ${diag.reasonText}.`;
-    } else if (currentPrice < struct.hardPivot && f1h < 0 && swingMap.mapSignal !== 'DROP_EXHAUSTION_ENTRY') {
+    } else if (swingMap.isBreakdownBelowLow || (currentPrice < struct.hardPivot && f1h < 0 && swingMap.mapSignal !== 'DROP_EXHAUSTION_ENTRY')) {
       regime = 'HARD_PIVOT_BREAK';
       cardClass = 'summary-card bear';
-      headline = `ΣΚΛΗΡΟ PIVOT (${diag.totalScore}): Διάσπαση κάτω από $${fmtPrice(struct.hardPivot)} με πωλητική ροή`;
-      detail = `${macroLeg.detail} Η δομή γύρισε καθοδικά (${fmtUsd(f1h)} στο 1h). ${swingMap.mapAdvice} ${diag.reasonText}.`;
-    } else if (swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY' || sfAlign.code === 'SPOT_ABSORPTION') {
+      headline = `ΚΑΘΟΔΙΚΗ ΔΙΑΣΠΑΣΗ (${diag.totalScore}): Κάτω από $${fmtPrice(Math.min(struct.hardPivot, swingMap.lastLow))}`;
+      detail = `${macroLeg.detail} ${swingMap.mapAdvice} ${diag.reasonText}.`;
+    } else if ((swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY' || sfAlign.code === 'SPOT_ABSORPTION') && safelyBullishAllowed) {
       cardClass = 'summary-card bull';
-    } else if (swingMap.mapSignal === 'BULL_BREAK_READY' && sfAlign.isValidBullFlow && !sfAlign.upperWickRejection) {
+    } else if (swingMap.mapSignal === 'BULL_BREAK_READY' && sfAlign.isValidBullFlow && !sfAlign.upperWickRejection && safelyBullishAllowed) {
       cardClass = 'summary-card bull';
     } else if (swingMap.mapSignal === 'BEAR_BREAK_READY') {
       cardClass = 'summary-card bear';
@@ -2192,7 +2219,7 @@ async function runCycle() {
         regime = 'PERP_SPOT_DIVERGENCE';
         headline = `Ασυμφωνία Futures CVD με Spot (${diag.totalScore}) — άνοδος σε μόχλευση`;
       }
-    } else if (sfAlign.isValidBullFlow && dF1h >= 0 && !sfAlign.upperWickRejection) {
+    } else if (sfAlign.isValidBullFlow && dF1h >= 0 && !sfAlign.upperWickRejection && safelyBullishAllowed) {
       regime = 'ALIGNED_BULL';
       cardClass = 'summary-card bull';
       headline = `Θετική εισροή (${diag.totalScore}): Futures & Spot προς Pool $${fmtPrice(struct.supplyBottom)}`;
