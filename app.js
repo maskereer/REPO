@@ -466,6 +466,112 @@ function computeSpotFuturesAlignment(snapNow, m5Snap, venueFlowStats, klines15m,
   };
 }
 
+// --- 4. Level Approach & Break-vs-Sweep Estimator ---
+function evaluateLevelApproachForecast(currentPrice, struct, swingMap, m5Snap, rollingStats, sfAlign, liqInfo, sessionCtx) {
+  const sc = sessionCtx?.flowScale ?? 1;
+  const upperCandidates = [
+    { name: swingMap.highTrend || 'SWG-H', px: swingMap.lastHigh },
+    { name: 'POOL', px: struct.supplyBottom }
+  ].filter(x => x.px > currentPrice * 1.0005).sort((a, b) => a.px - b.px);
+
+  const lowerCandidates = [
+    { name: swingMap.lowTrend || 'SWG-L', px: swingMap.lastLow },
+    { name: 'H-PIV', px: struct.hardPivot },
+    { name: 'LIQ50', px: liqInfo?.longLiq50x || 0 }
+  ].filter(x => x.px > 0 && x.px < currentPrice * 0.9995).sort((a, b) => b.px - a.px);
+
+  const upTarget = upperCandidates[0] || { name: 'POOL', px: struct.supplyBottom };
+  const dnTarget = lowerCandidates[0] || { name: 'H-PIV', px: struct.hardPivot };
+
+  const distUpPct = ((upTarget.px - currentPrice) / Math.max(currentPrice, 1)) * 100;
+  const distDnPct = ((currentPrice - dnTarget.px) / Math.max(currentPrice, 1)) * 100;
+
+  // Decide which side is the active approach
+  const approachUp = distUpPct <= distDnPct || (rollingStats.f15PerMin > 80000 * sc && distUpPct <= 1.2);
+  const target = approachUp ? upTarget : dnTarget;
+  const distPct = approachUp ? distUpPct : distDnPct;
+
+  let breakPts = 50;
+  const notes = [];
+
+  if (approachUp) {
+    if (rollingStats.f15PerMin > 180000 * sc && rollingStats.consistencyPct >= 60) {
+      breakPts += 14;
+      notes.push(`ροή ${fmtUsd(rollingStats.f15PerMin)}/λ`);
+    } else if (rollingStats.f15PerMin < 50000 * sc || swingMap.posInCorridor >= 0.72) {
+      breakPts -= 14;
+      notes.push('επιβράδυνση/ψηλά στο εύρος');
+    }
+
+    if (sfAlign?.code === 'BOTH_BUYING' || rollingStats.spotLeading) {
+      breakPts += 12;
+      notes.push('Spot στήριξη');
+    } else if (sfAlign?.isLeverageTrap) {
+      breakPts -= 16;
+      notes.push('μόνο Perps/παγίδα');
+    }
+
+    if (sfAlign?.upperWickRejection) {
+      breakPts -= 12;
+      notes.push('άνω ουρά');
+    }
+
+    if (m5Snap.isAbsorption && swingMap.posInCorridor >= 0.65) {
+      breakPts -= 8;
+      notes.push('απορρόφηση κοντά σε κορυφή');
+    }
+
+    if (liqInfo?.shortCrowded && (liqInfo?.oiDeltaUsd ?? 0) >= 0) {
+      breakPts += 10;
+      notes.push('shorts/ρευστότητα από πάνω');
+    }
+  } else {
+    if (rollingStats.f15PerMin < -180000 * sc && rollingStats.consistencyPct >= 60 && !rollingStats.deceleratingDown) {
+      breakPts += 14;
+      notes.push(`πίεση ${fmtUsd(rollingStats.f15PerMin)}/λ`);
+    } else if (rollingStats.deceleratingDown || m5Snap.isAbsorption || sfAlign?.code === 'SPOT_ABSORPTION') {
+      breakPts -= 16;
+      notes.push('φρενάρει/απορρόφηση Spot');
+    }
+
+    if (sfAlign?.lowerWickRejection) {
+      breakPts -= 10;
+      notes.push('κάτω ουρά');
+    }
+
+    if (liqInfo?.longCrowded && (liqInfo?.oiDeltaUsd ?? 0) >= 0) {
+      breakPts += 10;
+      notes.push('longs/ρευστότητα από κάτω');
+    }
+  }
+
+  breakPts = Math.max(20, Math.min(82, Math.round(breakPts)));
+  const sweepOrRejectPts = 100 - breakPts;
+
+  let verdict = 'ΑΜΦΙΡΡΟΠΟ';
+  let shortTag = `Προς ${target.name} ($${fmtPrice(target.px)}, ${distPct.toFixed(2)}%): Σπασ ${breakPts}% / Γύρ ${sweepOrRejectPts}%`;
+
+  if (breakPts >= 60) {
+    verdict = approachUp ? 'ΠΙΘΑΝΟ ΠΕΡΑΣΜΑ ΠΑΝΩ' : 'ΠΙΘΑΝΟ ΣΠΑΣΙΜΟ ΚΑΤΩ';
+  } else if (sweepOrRejectPts >= 58) {
+    verdict = approachUp ? 'ΚΙΝΔΥΝΟΣ SWEEP & ΑΠΟΡΡΙΨΗΣ' : 'ΚΙΝΔΥΝΟΣ SWEEP & ΑΝΑΚΤΗΣΗΣ';
+  }
+
+  const detail = `${verdict} προς ${target.name} $${fmtPrice(target.px)} (${distPct.toFixed(2)}% μακριά) · Εκτίμηση προσπέρασης ${breakPts}% vs γυρίσματος/sweep ${sweepOrRejectPts}%${notes.length ? ` (${notes.join(', ')})` : ''}.`;
+
+  return {
+    approachUp,
+    targetName: target.name,
+    targetPrice: target.px,
+    distPct,
+    breakPts,
+    sweepOrRejectPts,
+    verdict,
+    shortTag,
+    detail
+  };
+}
+
 // --- Rolling CVD Velocity, Acceleration & Consistency Calculator ---
 function recordCvdSample(nowTs, currentPrice, m5Snap, snapNow, swingKey, f15PerMin = 0, takerBuyPct = 50, sfState = 'MIXED') {
   state.cvdHistory.push({
@@ -1148,7 +1254,7 @@ function analyzeAdaptiveSwingMap(klines15m, currentPrice, snapNow, m5Snap, delta
 
 // Autonomous background critic: flags blind spots, contradictions, rolling exhaustion, or traps
 function evaluateAutonomousAdvisor(ctx) {
-  const { currentPrice, struct, swingMap, diag, snapNow, m5Snap, deltaNow, hlData, rollingStats, prevSwingLeg, shadowInfo, sfAlign, sessionCtx, liqInfo } = ctx;
+  const { currentPrice, struct, swingMap, diag, snapNow, m5Snap, deltaNow, hlData, rollingStats, prevSwingLeg, shadowInfo, sfAlign, sessionCtx, liqInfo, levelForecast } = ctx;
   const sc = sessionCtx?.flowScale ?? 1;
   const fSw = snapNow['SWING'].fut;
   const sSw = snapNow['SWING'].spot;
@@ -1161,7 +1267,11 @@ function evaluateAutonomousAdvisor(ctx) {
   let title = '';
   let msg = '';
 
-  if (sessionCtx?.code === 'WEEKEND_THIN' && liqInfo?.longCrowded && swingMap.posInCorridor >= 0.65) {
+  if (levelForecast && levelForecast.distPct <= 0.45 && (levelForecast.breakPts >= 62 || levelForecast.sweepOrRejectPts >= 60)) {
+    code = 'LEVEL_APPROACH_FORECAST';
+    title = `ΣΥΜΒΟΥΛΟΣ · ${levelForecast.verdict}`;
+    msg = levelForecast.detail;
+  } else if (sessionCtx?.code === 'WEEKEND_THIN' && liqInfo?.longCrowded && swingMap.posInCorridor >= 0.65) {
     code = 'WKND_LONG_TRAP';
     title = 'ΣΥΜΒΟΥΛΟΣ · ΣΚ ΛΕΠΤΟ ΒΙΒΛΙΟ & LONGS';
     msg = `Σαββατοκύριακο με λεπτό βιβλίο, θετικό funding και ${liqInfo.magnetSummary}. Υψηλός κίνδυνος για απότομο καθοδικό sweep.`;
@@ -1944,6 +2054,9 @@ async function runCycle() {
     const shadowInfo = evaluateAlgoShadowMechanics(
       nowTs, fut15, currentPrice, struct, swingMap, m5Snap, rollingStats, hlData, sfAlign, sessionCtx
     );
+    const levelForecast = evaluateLevelApproachForecast(
+      currentPrice, struct, swingMap, m5Snap, rollingStats, sfAlign, liqInfo, sessionCtx
+    );
 
     drawChart(fut15, struct, swingMap, liqInfo);
 
@@ -1954,7 +2067,7 @@ async function runCycle() {
       ? ` · Προηγ. SWG: ${fmtUsd(state.prevSwingLeg.fut)}`
       : '';
     document.getElementById('sweepBreakVal').textContent =
-      `${struct.zoneBehavior} · ${shadowInfo.shadowTag} · ${liqInfo.magnetSummary}${prevLegTxt}`;
+      `${levelForecast.shortTag} · ${shadowInfo.shadowTag} · ${liqInfo.magnetSummary}${prevLegTxt}`;
     document.getElementById('zoneStatus').textContent =
       `${sessionCtx.label} · ${shadowInfo.shadowTag} · W:${swingMap.windowBars} · $${fmtPrice(swingMap.lastLow)} (${swingMap.lowTrend}) ↔ $${fmtPrice(swingMap.lastHigh)} (${swingMap.highTrend})`;
     document.getElementById('zoneLegend').innerHTML = `
@@ -1987,19 +2100,19 @@ async function runCycle() {
     let regime = swingMap.mapSignal;
     let cardClass = 'summary-card';
     let headline = `${swingMap.mapHeadline} (${diag.totalScore})`;
-    let detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
+    let detail = `${levelForecast.detail} ${swingMap.mapAdvice} ${diag.reasonText}.`;
     let syncLabel = `${sfAlign.label} · SpotBuy ${sfAlign.spotBuyPct.toFixed(1)}% · ${shadowInfo.shadowTag}`;
 
     if (shadowInfo.shadowTag.includes('SWEEP & RECLAIM') && !sfAlign.isLeverageTrap) {
       regime = 'SHADOW_SWEEP_RECLAIM';
       cardClass = 'summary-card bull';
       headline = `SHADOW RECLAIM (${diag.totalScore}): Ανάκτηση επιπέδου μετά από sweep`;
-      detail = `${shadowInfo.shadowAlert?.body || swingMap.mapAdvice} ${diag.reasonText}.`;
+      detail = `${levelForecast.detail} ${shadowInfo.shadowAlert?.body || swingMap.mapAdvice} ${diag.reasonText}.`;
     } else if (currentPrice < struct.hardPivot && f1h < 0 && swingMap.mapSignal !== 'DROP_EXHAUSTION_ENTRY') {
       regime = 'HARD_PIVOT_BREAK';
       cardClass = 'summary-card bear';
       headline = `ΣΚΛΗΡΟ PIVOT (${diag.totalScore}): Διάσπαση κάτω από $${fmtPrice(struct.hardPivot)} με πωλητική ροή`;
-      detail = `Η δομή γύρισε καθοδικά (${fmtUsd(f1h)} στο 1h). ${swingMap.mapAdvice} ${diag.reasonText}.`;
+      detail = `${levelForecast.detail} Η δομή γύρισε καθοδικά (${fmtUsd(f1h)} στο 1h). ${swingMap.mapAdvice} ${diag.reasonText}.`;
     } else if (swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY' || sfAlign.code === 'SPOT_ABSORPTION') {
       cardClass = 'summary-card bull';
     } else if (swingMap.mapSignal === 'BULL_BREAK_READY' && sfAlign.isValidBullFlow && !sfAlign.upperWickRejection) {
@@ -2016,12 +2129,12 @@ async function runCycle() {
       regime = 'ALIGNED_BULL';
       cardClass = 'summary-card bull';
       headline = `Θετική εισροή (${diag.totalScore}): Futures & Spot προς Pool $${fmtPrice(struct.supplyBottom)}`;
-      detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
+      detail = `${levelForecast.detail} ${swingMap.mapAdvice} ${diag.reasonText}.`;
     } else if (f1h > 0 && s1h <= 0) {
       regime = 'PERP_SPOT_DIVERGENCE';
       cardClass = 'summary-card warn';
       headline = `Ασυμφωνία Futures CVD με Spot (${diag.totalScore}) — άνοδος σε μόχλευση`;
-      detail = `${swingMap.mapAdvice} ${diag.reasonText}.`;
+      detail = `${levelForecast.detail} ${swingMap.mapAdvice} ${diag.reasonText}.`;
     }
 
     const advisorNote = evaluateAutonomousAdvisor({
@@ -2038,7 +2151,8 @@ async function runCycle() {
       shadowInfo,
       sfAlign,
       sessionCtx,
-      liqInfo
+      liqInfo,
+      levelForecast
     });
 
     if (advisorNote) {
@@ -2053,7 +2167,7 @@ async function runCycle() {
       `S-Pivot $${fmtPrice(struct.softPivot)} · H-Pivot $${fmtPrice(struct.hardPivot)}`;
 
     const priceBucket = Math.max(currentPrice * 0.0008, 0.0001);
-    const signature = `${sessionCtx.code}|${regime}|${sfAlign.code}|${shadowInfo.shadowTag}|${swingMap.windowBars}|${Math.round(currentPrice / priceBucket)}|${Math.round(diag.totalScore / 10)}|${advisorNote?.code || ''}`;
+    const signature = `${sessionCtx.code}|${regime}|${sfAlign.code}|${shadowInfo.shadowTag}|${swingMap.windowBars}|${Math.round(currentPrice / priceBucket)}|${Math.round(diag.totalScore / 10)}|${levelForecast.verdict}|${advisorNote?.code || ''}`;
     if (signature !== state.lastSummarySignature) {
       state.lastSummarySignature = signature;
       const card = document.getElementById('summaryCard');
