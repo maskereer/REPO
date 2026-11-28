@@ -375,140 +375,146 @@ function analyze1mMicroStructure(fut1m, spot1m, currentPrice) {
   };
 }
 
-// --- Adaptive Macro + 5m Micro Truth Evaluator (LONG & SHORT) ---
+// --- Adaptive Macro + 5m Micro Truth Evaluator (Mean-Reversion First) ---
 function evaluateMacroMicroEntry(currentPrice, struct, swingMap, snapNow, m5Snap, sfAlign, shadowInfo, liqInfo, rollingStats, thresholds) {
   const f15 = snapNow['15m']?.fut ?? 0;
   const s15 = snapNow['15m']?.spot ?? 0;
   const f1h = snapNow['1h']?.fut ?? 0;
   const s1h = snapNow['1h']?.spot ?? 0;
   const f4h = snapNow['4h']?.fut ?? 0;
-  const s4h = snapNow['4h']?.spot ?? 0;
-  const fSw = snapNow['SWING']?.fut ?? 0;
-  const sSw = snapNow['SWING']?.spot ?? 0;
 
   const w5Fut = m5Snap.fut * m5Snap.weightMult;
   const w5Spot = m5Snap.spot * m5Snap.weightMult;
   const m5Th = thresholds?.micro5mCumThresh ?? 100000;
   const f15Th = thresholds?.m15FlowThresh ?? 150000;
+  const rateTh = thresholds?.ratePerMinThresh ?? 50000;
 
-  // 1. Honest Macro Truth (4h / 1h / Spot)
+  // Mean reference levels for reversion targets
+  const corridorMid = (swingMap.lastHigh + swingMap.lastLow) / 2;
+  const meanTargetUp = currentPrice < struct.softPivot
+    ? struct.softPivot
+    : (currentPrice < corridorMid ? corridorMid : Math.max(struct.supplyBottom, swingMap.lastHigh));
+  const meanTargetDown = currentPrice > struct.softPivot
+    ? struct.softPivot
+    : (currentPrice > corridorMid ? corridorMid : Math.max(struct.demandTop, swingMap.lastLow));
+
+  // Macro context (informational bias, not blocking valid mean-reversion setups)
   let macroDir = 0;
-  let macroTruth = 'MACRO: ΠΛΑΓΙΟ / ΜΕΙΚΤΟ';
+  let macroTruth = 'MACRO: ΙΣΟΡΡΟΠΙΑ / ΜΕΙΚΤΟ';
   if (f4h > 0 && (f1h > 0 || s1h > 0)) {
     macroDir = 1;
-    macroTruth = 'MACRO (4h/1h): ΑΝΟΔΙΚΗ ΡΟΗ';
+    macroTruth = 'MACRO (4h/1h): ΑΝΟΔΙΚΗ ΤΑΣΗ';
   } else if (f4h < 0 && f1h <= 0) {
     macroDir = -1;
-    macroTruth = 'MACRO (4h/1h): ΚΑΘΟΔΙΚΗ ΠΙΕΣΗ';
+    macroTruth = 'MACRO (4h/1h): ΚΑΘΟΔΙΚΗ ΤΑΣΗ';
   } else if (s1h > f15Th && f1h > 0) {
     macroDir = 1;
     macroTruth = 'MACRO (1h): SPOT ΥΠΕΡ';
   } else if (s1h < -f15Th && f1h < 0) {
     macroDir = -1;
-    macroTruth = 'MACRO (1h): ΔΙΑΝΟΜΗ / ΠΙΕΣΗ';
+    macroTruth = 'MACRO (1h): ΠΙΕΣΗ ΠΡΟΣΦΟΡΑΣ';
   }
-
-  // 2. Honest 5m Micro Truth (5m CVD + Absorption + Volume Weight + Corridor/Structure)
-  const m5Bullish = (w5Fut > m5Th * 0.65 && s15 >= -f15Th * 0.5) || (m5Snap.isAbsorption && (w5Fut > 0 || w5Spot > 0));
-  const m5Bearish = (w5Fut < -m5Th * 0.65 && (s15 <= f15Th * 0.5 || sfAlign.code === 'BOTH_SELLING')) || (m5Snap.isAbsorption && w5Fut < 0);
 
   const posPct = Math.round(swingMap.posInCorridor * 100);
   const corridorLabel = `15m: ${swingMap.lowTrend} $${fmtPrice(swingMap.lastLow)} ↔ ${swingMap.highTrend} $${fmtPrice(swingMap.lastHigh)} (${posPct}%)`;
   const m5Label = `5m Micro: ${fmtUsd(m5Snap.fut)} [${m5Snap.qualityTag}] · Spot 15m ${fmtUsd(s15)}`;
 
-  const highCorridorThresh = Math.max(0.65, Math.min(0.82, 0.75 - thresholds.atr15Pct * 4));
-  const lowCorridorThresh = Math.min(0.35, Math.max(0.18, 0.25 + thresholds.atr15Pct * 4));
+  const highCorridorThresh = Math.max(0.65, Math.min(0.85, 0.75 - thresholds.atr15Pct * 4));
+  const lowCorridorThresh = Math.min(0.35, Math.max(0.15, 0.25 + thresholds.atr15Pct * 4));
 
-  // Evaluate LONG truth (requires structural safety + non-trap flow + 5m/macro alignment)
+  // Detect exhaustion / absorption / slowing downside after a push or break at lower structure
+  const downExhaustion =
+    m5Snap.isAbsorption ||
+    rollingStats.deceleratingDown ||
+    (rollingStats.hasHistory && rollingStats.f15PerMin > rateTh * 0.5) ||
+    w5Fut > m5Th * 0.45 ||
+    sfAlign.code === 'SPOT_ABSORPTION' ||
+    shadowInfo.shadowTag.includes('SWEEP & RECLAIM');
+
+  // Strong runaway breakdown (dangerous to fade blindly)
+  const runawayBreakdown =
+    swingMap.isBreakdownBelowLow &&
+    !downExhaustion &&
+    sfAlign.code === 'BOTH_SELLING' &&
+    w5Fut < -m5Th * 1.1;
+
+  // LONG Mean-Reversion score
   let longScore = 0;
-  const longAllowed =
-    !swingMap.isBreakdownBelowLow &&
-    !sfAlign.isLeverageTrap &&
-    sfAlign.code !== 'BOTH_SELLING' &&
-    (
-      m5Bullish ||
-      sfAlign.code === 'SPOT_ABSORPTION' ||
-      shadowInfo.shadowTag.includes('SWEEP & RECLAIM') ||
-      (swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY' && (w5Fut > 0 || m5Snap.isAbsorption || rollingStats.deceleratingDown))
-    );
+  const nearLowerEdge =
+    currentPrice <= swingMap.lastLow * (1 + thresholds.nearZonePct * 1.4) ||
+    currentPrice <= struct.demandTop ||
+    swingMap.posInCorridor <= lowCorridorThresh + 0.12 ||
+    shadowInfo.shadowTag.includes('SWEEP LOW') ||
+    shadowInfo.shadowTag.includes('SWEEP & RECLAIM');
 
-  if (longAllowed) {
-    longScore += 48;
-    if (macroDir > 0) longScore += 18;
-    else if (macroDir === 0) longScore += 8;
-    else longScore -= 12; // Counter-macro penalty unless sweep/reclaim/absorption is clear
-
-    if (swingMap.posInCorridor <= lowCorridorThresh + 0.15 || shadowInfo.shadowTag.includes('SWEEP & RECLAIM')) longScore += 12;
-    if (sfAlign.isValidBullFlow || sfAlign.code === 'SPOT_ABSORPTION') longScore += 12;
-    if (m5Snap.isAbsorption || m5Snap.volRatio >= 1.2) longScore += 6;
+  if (!runawayBreakdown && (nearLowerEdge || swingMap.mapSignal === 'DROP_EXHAUSTION_ENTRY' || shadowInfo.shadowTag.includes('SWEEP & RECLAIM'))) {
+    longScore += 45;
+    if (downExhaustion) longScore += 22;
+    if (w5Spot > 0 || s15 > 0 || sfAlign.code === 'SPOT_ABSORPTION') longScore += 10;
+    if (macroDir > 0) longScore += 8;
+    if (sfAlign.code === 'BOTH_SELLING' && !downExhaustion) longScore -= 18;
+    if (sfAlign.isLeverageTrap) longScore -= 12;
   }
 
-  // Evaluate SHORT truth (breakdown, rejection at upper corridor/resistance, or macro + 5m selling alignment)
+  // Detect exhaustion / absorption / slowing upside after a push or break at upper structure
+  const upExhaustion =
+    m5Snap.isAbsorption ||
+    sfAlign.upperWickRejection ||
+    sfAlign.isLeverageTrap ||
+    shadowInfo.shadowTag.includes('SWEEP & REJECT') ||
+    swingMap.mapSignal === 'RALLY_EXHAUSTION_WAIT' ||
+    (w5Fut < -m5Th * 0.45 && f15 <= f15Th) ||
+    (rollingStats.hasHistory && rollingStats.f15PerMin < -rateTh * 0.5);
+
+  const nearUpperEdge =
+    currentPrice >= swingMap.lastHigh * (1 - thresholds.nearZonePct * 1.4) ||
+    currentPrice >= struct.supplyBottom ||
+    swingMap.posInCorridor >= highCorridorThresh - 0.10 ||
+    shadowInfo.shadowTag.includes('SWEEP HIGH') ||
+    shadowInfo.shadowTag.includes('SWEEP & REJECT');
+
+  // SHORT Mean-Reversion score
   let shortScore = 0;
-  const shortAllowed =
-    !sfAlign.isValidBullFlow &&
-    (
-      swingMap.isBreakdownBelowLow ||
-      shadowInfo.shadowTag.includes('SWEEP & REJECT') ||
-      (m5Bearish && (macroDir <= 0 || swingMap.posInCorridor >= highCorridorThresh || sfAlign.code === 'BOTH_SELLING')) ||
-      (swingMap.posInCorridor >= highCorridorThresh && (w5Fut < -m5Th * 0.4 || sfAlign.upperWickRejection || sfAlign.isLeverageTrap))
-    );
-
-  if (shortAllowed) {
-    shortScore += 48;
-    if (macroDir < 0) shortScore += 18;
-    else if (macroDir === 0) shortScore += 8;
-    else shortScore -= 12;
-
-    if (swingMap.isBreakdownBelowLow || shadowInfo.shadowTag.includes('SWEEP & REJECT') || swingMap.posInCorridor >= highCorridorThresh) shortScore += 12;
-    if (sfAlign.code === 'BOTH_SELLING' || sfAlign.isLeverageTrap) shortScore += 12;
-    if (m5Snap.isAbsorption || m5Snap.volRatio >= 1.2) shortScore += 6;
+  if (nearUpperEdge || swingMap.mapSignal === 'RALLY_EXHAUSTION_WAIT' || shadowInfo.shadowTag.includes('SWEEP & REJECT')) {
+    shortScore += 45;
+    if (upExhaustion) shortScore += 22;
+    if (sfAlign.isLeverageTrap || liqInfo?.longCrowded) shortScore += 10;
+    if (macroDir < 0) shortScore += 8;
+    if (sfAlign.isValidBullFlow && !upExhaustion && currentPrice > swingMap.lastHigh * (1 + thresholds.breakTolPct)) shortScore -= 20;
   }
 
   let verdict = 'WAIT / NO-TRADE';
   let badgeClass = 'warn-txt';
   let qualityScore = 44;
   let planText = '';
-  let invalidationText = `Άκυρο κάτω από $${fmtPrice(Math.min(struct.hardPivot, swingMap.lastLow))} ή πάνω από $${fmtPrice(swingMap.lastHigh)}.`;
+  let invalidationText = `Άκυρο αν κλείσει καθαρά εκτός δομής ($${fmtPrice(struct.hardPivot)} / $${fmtPrice(swingMap.lastHigh)}) χωρίς επιστροφή.`;
 
-  const minActionableScore = 56;
+  const minActionableScore = 55;
 
   if (longScore >= minActionableScore && longScore >= shortScore) {
-    verdict = macroDir > 0 ? 'LONG · MACRO + 5m ALIGNED' : 'LONG · 5m REVERSAL / RECLAIM';
+    verdict = 'LONG · MEAN REVERT';
     badgeClass = 'pos';
-    qualityScore = Math.max(56, Math.min(95, longScore));
-    const targetLong = currentPrice < struct.softPivot ? struct.softPivot : Math.max(struct.supplyBottom, swingMap.lastHigh);
-    const stopLong = Math.min(swingMap.lastLow, struct.hardPivot) * (1 - thresholds.sweepTolPct);
-    planText = `LONG με στήριξη 5m (${fmtUsd(m5Snap.fut)}) & ${sfAlign.label}. Στόχος $${fmtPrice(targetLong)}${macroDir < 0 ? ' (προσοχή: το 4h/1h παραμένει βαρύ, διαχείριση γρήγορη).' : '.'}`;
-    invalidationText = `Ακύρωση LONG αν κλείσει 5m/15m κάτω από $${fmtPrice(stopLong)} ή γυρίσει σε Both Selling.`;
+    qualityScore = Math.max(55, Math.min(94, longScore));
+    const stopLong = Math.min(swingMap.lastLow, struct.hardPivot) * (1 - thresholds.sweepTolPct * 1.4);
+    planText = `LONG Mean-Reversion κοντά σε χαμηλό/βάση με ένδειξη εξάντλησης (${m5Snap.qualityTag}, 5m ${fmtUsd(m5Snap.fut)}). Επιστροφή-στόχος προς $${fmtPrice(meanTargetUp)}.`;
+    invalidationText = `Ακύρωση LONG αν σπάσει και μείνει κάτω από $${fmtPrice(stopLong)} με βαριά πώληση χωρίς άμεση ανάκτηση.`;
   } else if (shortScore >= minActionableScore && shortScore > longScore) {
-    verdict = swingMap.isBreakdownBelowLow
-      ? 'SHORT · BREAKDOWN 5m/15m'
-      : (macroDir < 0 ? 'SHORT · MACRO + 5m ALIGNED' : 'SHORT · FADE / REJECTION');
+    verdict = 'SHORT · MEAN REVERT';
     badgeClass = 'neg';
-    qualityScore = Math.max(56, Math.min(95, shortScore));
-    const targetShort = swingMap.isBreakdownBelowLow
-      ? Math.min(liqInfo.longLiq50x, struct.hardPivot)
-      : Math.max(struct.demandTop, swingMap.lastLow);
-    const stopShort = swingMap.isBreakdownBelowLow
-      ? swingMap.lastLow * (1 + thresholds.breakTolPct)
-      : Math.max(swingMap.lastHigh, struct.supplyBottom) * (1 + thresholds.sweepTolPct);
-    planText = `SHORT με πίεση 5m (${fmtUsd(m5Snap.fut)}) & ${sfAlign.label}. Στόχος $${fmtPrice(targetShort)} (Liq50x $${fmtPrice(liqInfo.longLiq50x)}).`;
-    invalidationText = `Ακύρωση SHORT αν κλείσει πάνω από $${fmtPrice(stopShort)} με καθαρή απορρόφηση/Spot αγορά.`;
+    qualityScore = Math.max(55, Math.min(94, shortScore));
+    const stopShort = Math.max(swingMap.lastHigh, struct.supplyBottom) * (1 + thresholds.sweepTolPct * 1.4);
+    planText = `SHORT Mean-Reversion κοντά σε κορυφή/αντίσταση με εξάντληση ώθησης (${sfAlign.label}, 5m ${fmtUsd(m5Snap.fut)}). Επιστροφή-στόχος προς $${fmtPrice(meanTargetDown)}.`;
+    invalidationText = `Ακύρωση SHORT αν σπάσει και κρατηθεί πάνω από $${fmtPrice(stopShort)} με ισχυρή αγορά/συνέχιση.`;
   } else {
-    // Honest truth when conditions conflict or lack clean edge
-    if (sfAlign.isLeverageTrap) {
-      qualityScore = 30;
-      planText = `WAIT — Η άνοδος στηρίζεται κυρίως σε μόχλευση/Perps χωρίς καθαρή στήριξη Spot (${sfAlign.shortDesc}). Μην κυνηγάς LONG στα τυφλά.`;
-    } else if (swingMap.isBreakdownBelowLow && !m5Bearish) {
-      qualityScore = 36;
-      planText = `WAIT — Κάτω από το $${fmtPrice(swingMap.lastLow)}, αλλά το 5m δεν έχει ακόμα καθαρή συνέχιση πώλησης. Περίμενε επιβεβαίωση ή reclaim.`;
-    } else if (macroDir < 0 && m5Bullish) {
-      qualityScore = 46;
-      planText = `WAIT / ΠΡΟΣΟΧΗ — Το 5m γυρίζει ανοδικά (${fmtUsd(m5Snap.fut)}), αλλά το 1h/4h παραμένει καθοδικό. Μπορεί να είναι προσωρινό pullback μέσα σε πτωτικό κύμα.`;
+    if (runawayBreakdown) {
+      qualityScore = 28;
+      planText = `WAIT — Ισχυρό σπάσιμο κάτω από $${fmtPrice(swingMap.lastLow)} με Both Selling χωρίς ένδειξη φρεναρίσματος. Επικίνδυνο mean reversion όσο τρέχει η πτώση.`;
+    } else if (posPct > 35 && posPct < 65) {
+      qualityScore = 42;
+      planText = `WAIT — Η τιμή είναι στη μέση του εύρους (${posPct}%). Για mean reversion περιμένεις τέντωμα/σπάσιμο σε άκρο ή pivot και μετά σημάδι εξάντλησης.`;
     } else {
       qualityScore = 45;
-      planText = `WAIT — Δεν υπάρχει καθαρή συμφωνία Macro + 5m (${corridorLabel}). Καλύτερη υπομονή μέχρι να ξεκαθαρίσει ροή και επίπεδο.`;
+      planText = `WAIT — Κοντά σε όριο αλλά δεν έχει φανεί καθαρή εξάντληση/απορρόφηση στο 5m (${corridorLabel}). Υπομονή για το γύρισμα.`;
     }
   }
 
@@ -523,6 +529,7 @@ function evaluateMacroMicroEntry(currentPrice, struct, swingMap, snapNow, m5Snap
     invalidationText
   };
 }
+
 
 function renderMacroMicroBox(mm) {
   const el = document.getElementById('macroMicroEntryBox');
